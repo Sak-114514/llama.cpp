@@ -276,6 +276,61 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
 }
 
+// unary_gated_op_kernel that also writes its output quantized to q8_1 exactly as quantize_q8_1 does, laid out for a GEMV
+// that reads the output as rows of ne10 (padded to ne10_padded with zero quants). One warp per quant block.
+template <float (*op)(float)>
+static __global__ void unary_gated_q8_kernel(const float * x, const float * g, float * dst, const int64_t n, const int64_t o0,
+        const int64_t o1, block_q8_1 * y, const int64_t ne10, const int64_t ne10_padded) {
+    const int64_t c = (int64_t) blockDim.x*blockIdx.x + threadIdx.x; // column in the GEMV's row
+    const int64_t r = blockIdx.y;
+    if (c >= ne10_padded) {
+        return;
+    }
+    float xi = 0.0f;
+    if (c < ne10) {
+        const int64_t i  = r*ne10 + c;
+        const int64_t j0 = (i / n) * o0 + (i % n);
+        const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+        xi = op(x[j0]) * g[j1];
+        dst[i] = xi;
+    }
+    float amax = fabsf(xi);
+    float sum  = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int64_t i_cont = r*ne10_padded + c;
+    y[i_cont / QK8_1].qs[i_cont % QK8_1] = q;
+    if (i_cont % QK8_1 == 0) {
+        y[i_cont / QK8_1].ds = make_half2(d, sum);
+    }
+}
+
+// if a quantized GEMV reads dst next, write dst and its q8_1 form in one kernel; false if not applicable
+template <float (*op)(float)>
+static bool unary_gated_q8_try(ggml_backend_cuda_context & ctx, const ggml_tensor * dst_node, const float * x, const float * g,
+        float * dst, const int64_t n, const int64_t o0, const int64_t o1) {
+    static const bool disabled = getenv("GGML_CUDA_NO_Q8_PRODUCE") != nullptr || getenv("GGML_CUDA_NO_Q8_CACHE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * key = ctx.q8_1_consumer(dst_node);
+    if (key == nullptr) {
+        return false;
+    }
+    const int64_t ne10        = key->ne[0];
+    const int64_t nrows       = ggml_nrows(key);
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    void * y = ctx.q8_1_cache_produce(key, dst_node, nrows*ne10_padded/QK8_1*sizeof(block_q8_1));
+    if (y == nullptr) {
+        return false;
+    }
+    const dim3 blocks((ne10_padded + 255) / 256, nrows, 1);
+    unary_gated_q8_kernel<op><<<blocks, 256, 0, ctx.stream()>>>(x, g, dst, n, o0, o1, (block_q8_1 *) y, ne10, ne10_padded);
+    return true;
+}
+
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
@@ -333,7 +388,9 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
-        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        if (!unary_gated_q8_try<op>(ctx, dst, src0_p, src1_p, (float *) dst_d, nc, src0_o / sizeof(float), src1_o / sizeof(float))) {
+            unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        }
     }
 }
 
@@ -680,9 +737,12 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (half *) mul_node->data, k, nc,
                              unary_stride / sizeof(half), other_stride / sizeof(half), stream);
     } else {
-        unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
-                             (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+        if (!unary_gated_q8_try<op>(ctx, mul_node, (const float *) unary_src->data, (const float *) other_src->data,
+                                    (float *) mul_node->data, nc, unary_stride / sizeof(float), other_stride / sizeof(float))) {
+            unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
+                                 (float *) mul_node->data, k, nc,
+                                 unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+        }
     }
 }
 
@@ -699,6 +759,194 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
             break;
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
+    }
+}
+
+/* fused short elementwise chains around one unary op (decode graphs are launch-bound):
+ *   SCALE -> UNARY                 u(x*s + b)
+ *   ADD   -> UNARY -> MUL          u(x + c) * d
+ *   UNARY -> MUL   -> ADD          u(g) * a + c
+ * operands are contiguous F32 and broadcast against the chain's output shape */
+
+// operand index modes against the output's flat index i (ne0 = output row length):
+//   0: same shape (i)   1: one row broadcast over rows (i % ne0)   2: one value per row (i / ne0)
+//   3: one value for everything
+struct elem_chain_operand {
+    const float * data = nullptr;
+    int mode = 0;
+};
+
+struct elem_chain_args {
+    elem_chain_operand u;      // unary input (before scale/bias/pre_add)
+    elem_chain_operand pre;    // added before the unary
+    elem_chain_operand mul;    // multiplied after the unary
+    elem_chain_operand post;   // added last
+    float scale = 1.0f;
+    float bias  = 0.0f;
+};
+
+static __device__ __forceinline__ float elem_chain_load(const elem_chain_operand & o, const int i, const int i0, const int i1) {
+    switch (o.mode) {
+        case 0:  return o.data[i];
+        case 1:  return o.data[i0];
+        case 2:  return o.data[i1];
+        default: return o.data[0];
+    }
+}
+
+template <float (*op)(float), bool has_scale, bool has_pre, bool has_mul, bool has_post>
+static __global__ void elem_chain_f32(const elem_chain_args args, float * dst, const int n, const uint3 ne0_fd) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint2 dm = fast_div_modulo((uint32_t) i, ne0_fd);
+    const int i1 = dm.x;
+    const int i0 = dm.y;
+
+    float v = elem_chain_load(args.u, i, i0, i1);
+    if constexpr (has_scale) {
+        v = args.scale * v + args.bias;
+    }
+    if constexpr (has_pre) {
+        v = v + elem_chain_load(args.pre, i, i0, i1);
+    }
+    v = op(v);
+    if constexpr (has_mul) {
+        v = v * elem_chain_load(args.mul, i, i0, i1);
+    }
+    if constexpr (has_post) {
+        v = v + elem_chain_load(args.post, i, i0, i1);
+    }
+    dst[i] = v;
+}
+
+static int elem_chain_mode(const ggml_tensor * t, const ggml_tensor * dst) {
+    if (ggml_are_same_shape(t, dst)) {
+        return 0;
+    }
+    if (ggml_nelements(t) == 1) {
+        return 3;
+    }
+    if (t->ne[0] == dst->ne[0] && ggml_nelements(t) == t->ne[0]) {
+        return 1;
+    }
+    if (t->ne[0] == 1 && ggml_nelements(t) == ggml_nrows(dst)) {
+        // one value per output row: rows must enumerate in the same order
+        for (int d = 1; d < 4; ++d) {
+            if (t->ne[d] != dst->ne[d]) {
+                return -1;
+            }
+        }
+        return 2;
+    }
+    return -1;
+}
+
+static bool elem_chain_operand_ok(const ggml_tensor * t, const ggml_tensor * dst) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && elem_chain_mode(t, dst) >= 0;
+}
+
+static elem_chain_operand elem_chain_operand_of(const ggml_tensor * t, const ggml_tensor * dst) {
+    elem_chain_operand o;
+    o.data = (const float *) t->data;
+    o.mode = elem_chain_mode(t, dst);
+    return o;
+}
+
+static bool elem_chain_unary_supported(const ggml_tensor * unary) {
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_SOFTPLUS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_elem_chain_supported(const ggml_tensor * const * nodes, const int n_nodes) {
+    const ggml_tensor * out = nodes[n_nodes - 1];
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || ggml_nelements(out) >= INT32_MAX) {
+        return false;
+    }
+    for (int k = 0; k < n_nodes; ++k) {
+        const ggml_tensor * t = nodes[k];
+        if (t->op == GGML_OP_UNARY && !elem_chain_unary_supported(t)) {
+            return false;
+        }
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+        for (int j = 0; j < 2; ++j) {
+            const ggml_tensor * s = t->src[j];
+            if (s && (k == 0 || s != nodes[k - 1]) && !elem_chain_operand_ok(s, out)) {
+                return false;
+            }
+        }
+        // every intermediate result has the output's shape, except a broadcast unary input feeding MUL
+        if (k > 0 && k < n_nodes - 1 && !ggml_are_same_shape(t, out)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <float (*op)(float)>
+static void elem_chain_launch(const elem_chain_args & args, float * dst, const int n, const uint3 ne0_fd, const bool has_scale,
+        const bool has_pre, const bool has_mul, const bool has_post, cudaStream_t stream) {
+    const int nb = (n + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    if (has_scale && !has_pre && !has_mul && !has_post) {
+        elem_chain_f32<op, true, false, false, false><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(args, dst, n, ne0_fd);
+    } else if (!has_scale && has_pre && has_mul && !has_post) {
+        elem_chain_f32<op, false, true, true, false><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(args, dst, n, ne0_fd);
+    } else if (!has_scale && !has_pre && has_mul && has_post) {
+        elem_chain_f32<op, false, false, true, true><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(args, dst, n, ne0_fd);
+    } else {
+        GGML_ABORT("unsupported elementwise chain");
+    }
+}
+
+// nodes: SCALE,UNARY | ADD,UNARY,MUL | UNARY,MUL,ADD
+void ggml_cuda_op_elem_chain(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, const int n_nodes) {
+    const ggml_tensor * out = nodes[n_nodes - 1];
+    elem_chain_args args;
+    bool has_scale = false, has_pre = false, has_mul = false, has_post = false;
+    const ggml_tensor * unary = nullptr;
+
+    const auto other = [](const ggml_tensor * node, const ggml_tensor * prev) {
+        return node->src[0] == prev ? node->src[1] : node->src[0];
+    };
+
+    if (nodes[0]->op == GGML_OP_SCALE) {
+        unary = nodes[1];
+        args.u = elem_chain_operand_of(nodes[0]->src[0], out);
+        memcpy(&args.scale, (const float *) nodes[0]->op_params + 0, sizeof(float));
+        memcpy(&args.bias,  (const float *) nodes[0]->op_params + 1, sizeof(float));
+        has_scale = true;
+    } else if (nodes[0]->op == GGML_OP_ADD) {
+        unary = nodes[1];
+        args.u   = elem_chain_operand_of(nodes[0]->src[0], out);
+        args.pre = elem_chain_operand_of(nodes[0]->src[1], out);
+        args.mul = elem_chain_operand_of(other(nodes[2], nodes[1]), out);
+        has_pre = has_mul = true;
+    } else {
+        unary = nodes[0];
+        args.u    = elem_chain_operand_of(nodes[0]->src[0], out);
+        args.mul  = elem_chain_operand_of(other(nodes[1], nodes[0]), out);
+        args.post = elem_chain_operand_of(other(nodes[2], nodes[1]), out);
+        has_mul = has_post = true;
+    }
+
+    const int n = (int) ggml_nelements(out);
+    const uint3 ne0_fd = init_fastdiv_values((uint32_t) out->ne[0]);
+    float * dst = (float *) out->data;
+    cudaStream_t stream = ctx.stream();
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SILU:     elem_chain_launch<op_silu>    (args, dst, n, ne0_fd, has_scale, has_pre, has_mul, has_post, stream); break;
+        case GGML_UNARY_OP_SIGMOID:  elem_chain_launch<op_sigmoid> (args, dst, n, ne0_fd, has_scale, has_pre, has_mul, has_post, stream); break;
+        case GGML_UNARY_OP_SOFTPLUS: elem_chain_launch<op_softplus>(args, dst, n, ne0_fd, has_scale, has_pre, has_mul, has_post, stream); break;
+        default: GGML_ABORT("unsupported unary op in elementwise chain");
     }
 }
 

@@ -17,6 +17,49 @@
 static void test(void) {
     common_params params;
 
+    {
+        common_speculative_mtp_adaptive first, second;
+        assert(first.limit(3, -1) == 2);
+        first.pending = 2; first.accept(2);
+        assert(first.depth == 3 && first.ema == 1.0);
+        first.accept(0); // No draft pending: do not count the round twice.
+        assert(first.ema == 1.0);
+        first.pending = 3; first.accept(0);
+        assert(first.depth == 3 && first.ema == 0.75);
+        first.pending = 3; first.accept(0);
+        assert(first.depth == 3 && first.ema == 0.5625);
+        first.pending = 3; first.accept(0);
+        assert(first.depth == 2);
+        for (int i = 0; i < 4; ++i) { first.pending = 2; first.accept(2); }
+        assert(first.depth == 3);
+        assert(first.limit(9, -1) == 3);
+        assert(first.limit(2, -1) == 2);
+        assert(first.limit(3, 1) == 1);
+        assert(first.limit(3, 0) == 0);
+        assert(first.limit(0, -1) == 0);
+        assert(second.depth == 2 && second.ema == -1.0);
+        second.pending = 1; second.accept(1); // Use actual verified count after truncation.
+        assert(second.depth == 3 && second.ema == 1.0);
+        second.reset();
+        assert(second.pending == 0 && second.ema == -1.0 && second.depth == 2);
+        first.reset();
+        first.pending = 3; first.accept(0); // Original verification rejected every draft.
+        assert(first.ema == 0.0 && first.depth == 2);
+        first.accept(1); // Checkpoint replay includes a replacement token, not a new draft.
+        assert(first.ema == 0.0 && first.depth == 2);
+        first.pending = 2; first.accept(2);
+        assert(first.ema == 0.25 && first.depth == 2);
+        first.reset();
+        first.pending = 2; first.accept(100);
+        assert(first.ema == 1.0);
+        second.reset(); second.pending = 10; second.accept(7);
+        assert(second.depth == 3);
+        second.reset(); second.depth = 3; second.pending = 20; second.accept(11);
+        assert(second.depth == 3);
+        second.pending = 20; second.accept(10);
+        assert(second.depth == 2);
+    }
+
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {
         const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
@@ -253,6 +296,15 @@ static void test(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+
+    {
+        common_params adaptive_params;
+        assert(!adaptive_params.speculative.draft.mtp_adaptive);
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-mtp-adaptive", "--spec-draft-n-max", "3"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive_params.speculative.draft.mtp_adaptive);
+        assert(adaptive_params.speculative.draft.n_max == 3);
+    }
 
     {
         common_params synth_params;

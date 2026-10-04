@@ -10,9 +10,11 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h"
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -92,6 +94,8 @@ static void usage(char ** argv) {
     LOG("  -s, --seed <seed>        Set the random seed for tensor initialization and token generation\n");
     LOG("  -d, --stdev <stdev>      Set the standard deviation of the tensor initialization distribution (default: 0.1f)\n");
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
+    LOG("  --qwen4exp-mtp           Run the Qwen4Exp MTP regression test on CPU\n");
+    LOG("  --qwen4exp-mtp-cuda      Run the Qwen4Exp MTP regression test on CUDA\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -112,7 +116,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -167,6 +171,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 8; // 1 layer per stack x 2 h-cycles x (3 l-cycles + 1) cache slots
     }
 
+    if (mtp) {
+        GGML_ASSERT(arch == LLM_ARCH_QWEN4EXP);
+        n_layer = 3;
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
@@ -450,6 +459,145 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
+}
+
+static int test_qwen4exp_mtp(size_t seed, bool cuda = false) {
+    auto gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    mp.devices = cpu_only;
+    ggml_backend_dev_t cuda_only[] = { nullptr, nullptr };
+    if (cuda) {
+        ggml_backend_load_all();
+        auto reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg || ggml_backend_reg_dev_count(reg) == 0) { throw std::runtime_error("CUDA regression requires a CUDA device"); }
+        cuda_only[0] = ggml_backend_reg_dev_get(reg, 0);
+        mp.devices = cuda_only;
+    }
+    mp.load_mtp = true;
+    mp.n_gpu_layers = cuda ? 99 : 0;
+    mp.progress_callback = silent_model_load_progress;
+    // the tolerances below are tuned for this stdev
+    tensor_data_params tensor_params = { seed, 1e-2f };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, mp));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP fixture");
+    }
+    auto cp = llama_context_default_params();
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.n_ctx = 256;
+    cp.n_threads = cp.n_threads_batch = 4;
+    cp.n_batch = cp.n_ubatch = 8;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+    llama_set_embeddings_nextn(ctx.get(), true, true);
+    const int width = llama_model_n_embd_out(model.get());
+    GGML_ASSERT(width == 4 * llama_model_n_embd(model.get()));
+    llama_batch batch = llama_batch_init(1, width, 1);
+    batch.token = (llama_token *) malloc(sizeof(llama_token));
+    std::vector<float> hidden(width, 0.1f);
+    std::vector<float> replay_input, replay_output;
+    for (int pos = 0; pos < 3; ++pos) {
+        batch.n_tokens = 0;
+        common_batch_add(batch, pos + 1, pos, {0}, true);
+        std::copy(hidden.begin(), hidden.end(), batch.embd);
+        if (pos == 1) {
+            replay_input = hidden;
+        }
+        if (llama_decode(ctx.get(), batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode MTP fixture");
+        }
+        const float * next = llama_get_embeddings_nextn_ith(ctx.get(), 0);
+        GGML_ASSERT(next);
+        for (int i = 0; i < width; ++i) {
+            GGML_ASSERT(std::isfinite(next[i]));
+        }
+        hidden.assign(next, next + width);
+        if (pos == 1) {
+            replay_output = hidden;
+        }
+    }
+    auto * memory = llama_get_memory(ctx.get());
+    GGML_ASSERT(llama_memory_seq_rm(memory, 0, 1, -1));
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == 0);
+    batch.n_tokens = 0;
+    common_batch_add(batch, 2, 1, {0}, true);
+    std::copy(replay_input.begin(), replay_input.end(), batch.embd);
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    const float * replay = llama_get_embeddings_nextn_ith(ctx.get(), 0);
+    for (int i = 0; i < width; ++i) {
+        GGML_ASSERT(std::abs(replay[i] - replay_output[i]) < 1e-6f);
+    }
+    llama_batch_free(batch);
+    ctx.reset();
+
+    auto target_params = llama_context_default_params();
+    target_params.n_ctx = 256;
+    target_params.n_batch = target_params.n_ubatch = 8;
+    target_params.n_threads = target_params.n_threads_batch = 4;
+    target_params.n_rs_seq = 3;
+    llama_context_ptr serial(llama_init_from_model(model.get(), target_params));
+    llama_context_ptr verify(llama_init_from_model(model.get(), target_params));
+    GGML_ASSERT(serial && verify);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    auto tb = llama_batch_init(8, 0, 1);
+    float max_error = 0;
+    auto decode_rows = [&](llama_context * target, const std::vector<llama_token> & tokens, int pos) {
+        tb.n_tokens = 0;
+        for (size_t i = 0; i < tokens.size(); ++i) { common_batch_add(tb, tokens[i], pos+i, {0}, true); }
+        GGML_ASSERT(llama_decode(target, tb) == 0);
+        std::vector<float> logits(tokens.size()*vocab);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const float * row = llama_get_logits_ith(target, i);
+            std::copy(row, row+vocab, logits.begin()+i*vocab);
+        }
+        return logits;
+    };
+    auto compare = [&](const float * actual, const float * expected) {
+        for (int i = 0; i < vocab; ++i) {
+            GGML_ASSERT(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+            max_error = std::max(max_error, std::abs(actual[i]-expected[i]));
+            if (std::abs(actual[i]-expected[i]) > 1e-4f*(1+std::abs(expected[i]))) {
+                throw std::runtime_error("Qwen4Exp verification/rollback differs from serial decode");
+            }
+        }
+    };
+    const std::vector<llama_token> prefix = {1, 2, 3, 4, 5, 6};
+    for (int drafts : {2, 3}) {
+        for (int accepted = 0; accepted <= drafts; ++accepted) {
+            llama_memory_clear(llama_get_memory(serial.get()), true);
+            llama_memory_clear(llama_get_memory(verify.get()), true);
+            for (size_t i = 0; i < prefix.size(); ++i) {
+                decode_rows(serial.get(), {prefix[i]}, i);
+                decode_rows(verify.get(), {prefix[i]}, i);
+            }
+            std::vector<llama_token> proposed;
+            for (int i = 0; i <= drafts; ++i) { proposed.push_back(7+i); }
+            auto parallel_logits = decode_rows(verify.get(), proposed, prefix.size());
+            for (int i = 0; i <= drafts; ++i) {
+                auto expected = decode_rows(serial.get(), {proposed[i]}, prefix.size()+i);
+                compare(parallel_logits.data()+i*vocab, expected.data());
+            }
+            const int keep = prefix.size()+1+accepted;
+            GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(verify.get()), 0, keep, -1));
+            llama_memory_clear(llama_get_memory(serial.get()), true);
+            for (int pos = 0; pos < keep; ++pos) {
+                decode_rows(serial.get(), {pos < int(prefix.size()) ? prefix[pos] : proposed[pos-prefix.size()]}, pos);
+            }
+            for (int pos = keep; pos < keep+4; ++pos) {
+                const llama_token replacement = 20+pos;
+                auto expected = decode_rows(serial.get(), {replacement}, pos);
+                auto actual = decode_rows(verify.get(), {replacement}, pos);
+                compare(actual.data(), expected.data());
+            }
+        }
+    }
+    llama_batch_free(tb);
+    printf("Qwen4Exp target batched verification and rollback: max logit error %.9g\n", max_error);
+    return 0;
 }
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -907,11 +1055,17 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     float stdev = 0.1f;
     std::string out;
+    bool qwen4exp_mtp = false;
+    bool qwen4exp_mtp_cuda = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+        if (strcmp(argv[i], "--qwen4exp-mtp-cuda") == 0) {
+            qwen4exp_mtp = qwen4exp_mtp_cuda = true;
+        } else if (strcmp(argv[i], "--qwen4exp-mtp") == 0) {
+            qwen4exp_mtp = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -974,6 +1128,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (qwen4exp_mtp) {
+            return test_qwen4exp_mtp(seed, qwen4exp_mtp_cuda);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }

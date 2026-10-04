@@ -4370,6 +4370,70 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// GGML_OP_HC_FUSED: mode 0 mix_down, 1 mix_up (after mix_down), 2 combine (after mix_down)
+struct test_hc_fused : public test_case {
+    const int     mode;
+    const int64_t n_embd;
+    const int64_t lr;
+    const int64_t n_tokens;
+    const bool    with_inject;
+    const int64_t hc = 4;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_FUSED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(mode, n_embd, lr, n_tokens, with_inject);
+    }
+
+    double max_nmse_err() override {
+        return 1e-3; // the CUDA kernels quantize the activations to int8 like the q8_1 GEMV path
+    }
+
+    test_hc_fused(int mode = 0, int64_t n_embd = 1024, int64_t lr = 320, int64_t n_tokens = 4, bool with_inject = true)
+        : mode(mode), n_embd(n_embd), lr(lr), n_tokens(n_tokens), with_inject(with_inject) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_inject = nullptr;
+        if (with_inject) {
+            w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+            ggml_set_name(w_inject, "w_inject");
+        }
+        ggml_tensor * down = ggml_hc_mix_down(ctx, x, w_norm, w_down, w_inject, 1e-6f);
+        ggml_set_name(down, "down");
+        if (mode == 0) {
+            return down;
+        }
+        if (mode == 1) {
+            ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd*hc);
+            ggml_set_name(w_up, "w_up");
+            ggml_tensor * out = ggml_hc_mix_up(ctx, x, w_norm, w_up, down);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(b, "block_out");
+        if (mode == 3) {
+            ggml_tensor * inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(inj, "inject");
+            ggml_tensor * out = ggml_hc_combine(ctx, b, x, inj);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        ggml_tensor * out = ggml_hc_combine(ctx, b, x, down);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9058,6 +9122,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+    for (int mode : {0, 1, 2, 3}) {
+        for (int64_t n_tokens : {1, 4, 5, 8}) {
+            test_cases.emplace_back(new test_hc_fused(mode, 1024, 320, n_tokens, true));
+        }
+        test_cases.emplace_back(new test_hc_fused(mode, 2560, 320, 4, false));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10969,6 +11039,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    for (int64_t tokens : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_topk_moe({512, tokens, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX));
+    }
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -11088,6 +11161,65 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // QWEN4EXP_MOE_PERF=1: only the qwen4exp routed-expert shapes (512 experts, top-10, hidden 2560, FFN 640),
+    // full and as the 1/4 slices a 4-way tensor split leaves on each GPU (gate/up rows 160, down K 160)
+    if (getenv("QWEN4EXP_MOE_PERF")) {
+        for (int64_t n_tokens : {1, 4}) {
+            for (int64_t ffn : {640, 160}) {
+                for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+                                       GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                    // gate or up: every expert reads the same token activations
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, true, ffn, n_tokens, 2560));
+                    // down: K = ffn, only block sizes that divide it
+                    if (ffn % ggml_blck_size(type) == 0) {
+                        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, ffn));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
+
+    // QWEN4EXP_TP4_PERF=1: the dense Q8_0 GEMVs of qwen4exp as each GPU of a 4-way tensor split sees them, 4 tokens
+    if (getenv("QWEN4EXP_TP4_PERF")) {
+        const std::vector<std::pair<int64_t, int64_t>> shapes = { // K, rows
+            {2560, 2560}, {2560, 1536}, {1536, 2560}, {2560, 3072}, {2560, 256}, {2560, 160}, {160, 2560}, {5120, 2560},
+        };
+        for (const auto & [k, m] : shapes) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 4, k, {1, 1}, {1, 1}));
+        }
+        // shared expert gate+up with the SwiGLU fused, as split and unsplit
+        for (int64_t m : {160, 640}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, m, 4, 2560, false, 1, 1, false, false, true, false, {1, 1}));
+        }
+        return test_cases;
+    }
+
+    // HC_FUSED_PERF=1: the fused hyper-connection ops at the qwen4exp shape
+    if (getenv("HC_FUSED_PERF")) {
+        for (int mode : {0, 1, 2}) {
+            test_cases.emplace_back(new test_hc_fused(mode, 2560, 320, 4, true));
+        }
+        return test_cases;
+    }
+
+    // QWEN4EXP_DENSE_PERF=1: only the qwen4exp dense GEMV shapes (type, K, rows), 1 and 4 tokens
+    if (getenv("QWEN4EXP_DENSE_PERF")) {
+        const std::vector<std::tuple<ggml_type, int64_t, int64_t>> shapes = {
+            {GGML_TYPE_Q8_0,  2560, 10240}, {GGML_TYPE_Q8_0, 6144, 2560}, {GGML_TYPE_Q8_0, 2560, 6144},
+            {GGML_TYPE_Q8_0,  2560, 12288}, {GGML_TYPE_Q8_0, 10240, 320}, {GGML_TYPE_Q8_0, 320, 10240},
+            {GGML_TYPE_Q8_0,  2560,   640}, {GGML_TYPE_Q8_0,  640, 2560}, {GGML_TYPE_Q8_0, 2560, 512},
+            {GGML_TYPE_Q6_K,  2560, 248320}, {GGML_TYPE_Q8_0, 2560, 248320}, {GGML_TYPE_Q4_0, 2560, 248320},
+            {GGML_TYPE_F32,   2560,   512}, {GGML_TYPE_F32,  2560,   48}, {GGML_TYPE_F32, 10240, 4},
+        };
+        for (int64_t n_tokens : {1, 4}) {
+            for (const auto & [type, k, m] : shapes) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n_tokens, k, {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

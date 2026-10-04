@@ -361,6 +361,9 @@ extern "C" {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
+        uint32_t n_ft_native_moe; // experimental global native expert slots
+        uint32_t n_moe_expert_cache;    // resident experts per expert tensor in VRAM (0 = off)
+        uint32_t n_moe_expert_inserts;  // max experts promoted per tensor per step
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
@@ -1047,6 +1050,10 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Greedy token of output i computed on the device (LLAMA_GPU_ARGMAX=1), or LLAMA_TOKEN_NULL when not
+    // available. Reading it does not copy the logits to the host.
+    LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

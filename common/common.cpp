@@ -1287,6 +1287,18 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+void common_mtp_apply_ubatch_override(llama_context_params & cparams) {
+    // LLAMA_MTP_N_UBATCH: a smaller micro-batch for the MTP context. Its compute buffer scales
+    // with n_ubatch (the draft head emits full-vocabulary logits), while drafting and
+    // verification catch-up only ever send a few tokens; prompt catch-up is split into ubatches.
+    if (const char * env = getenv("LLAMA_MTP_N_UBATCH")) {
+        const int n = atoi(env);
+        if (n > 0 && (uint32_t) n < cparams.n_ubatch) {
+            cparams.n_ubatch = n;
+        }
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1307,6 +1319,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            common_mtp_apply_ubatch_override(cparams_dft);
         }
         cparams_dft.n_rs_seq = 0;
 
@@ -1725,6 +1738,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_ft_native_moe = params.n_ft_native_moe;
+    cparams.n_moe_expert_cache   = params.n_moe_expert_cache;
+    cparams.n_moe_expert_inserts = params.n_moe_expert_inserts;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

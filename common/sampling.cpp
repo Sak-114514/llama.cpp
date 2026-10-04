@@ -10,10 +10,32 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+
+static bool full_step_timing_enabled() {
+    static const bool enabled = [] { const char * env = getenv("LLAMA_FULL_STEP_TIMING"); return env != nullptr && atoi(env) != 0; }();
+    return enabled;
+}
+
+struct full_step_sample_timing {
+    bool enabled; const llama_context * ctx; int idx; int64_t start_us;
+    const char * path = "normal";
+
+    full_step_sample_timing(const llama_context * ctx_, int idx_)
+            : enabled(full_step_timing_enabled()), ctx(ctx_), idx(idx_), start_us(enabled ? ggml_time_us() : 0) {}
+
+    ~full_step_sample_timing() {
+        if (!enabled) return;
+        const int64_t end_us = ggml_time_us();
+        LOG_INF("full-step sample ctx=%p idx=%d start_us=%" PRId64 " end_us=%" PRId64 " span_us=%" PRId64 " path=%s\n",
+                (const void *) ctx, idx, start_us, end_us, end_us - start_us, path);
+    }
+};
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -591,13 +613,98 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// Greedy sampling whose chain cannot move the maximum reduces to an argmax over the logits: the
+// temperature stage keeps only the largest logit, and nothing configured here can reorder or remove
+// it. Scanning the logits directly skips building (and partially sorting) a candidate array over
+// the whole vocabulary, which costs about a millisecond per token for a 248K vocabulary.
+static bool common_sampler_greedy_eligible(const common_sampler * gsmpl) {
+    static const bool disabled = [] {
+        const char * env = getenv("LLAMA_SAMPLER_NO_GREEDY_FAST");
+        return env && atoi(env) != 0;
+    }();
+    const auto & p = gsmpl->params;
+    if (disabled || !(p.temp <= 0.0f) || p.mirostat != 0 || p.n_probs > 0 || !p.logit_bias.empty() || gsmpl->grmr) {
+        return false;
+    }
+    if (p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
+        return false;
+    }
+    if (p.dry_multiplier != 0.0f && p.dry_penalty_last_n != 0) {
+        return false;
+    }
+    if (p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) {
+        return false;
+    }
+    for (const auto s : p.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_INFILL || s == COMMON_SAMPLER_TYPE_ADAPTIVE_P) {
+            return false;
+        }
+    }
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    full_step_sample_timing full_timing(ctx, idx);
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
+
+    if (common_sampler_greedy_eligible(gsmpl) &&
+            llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr && llama_get_sampled_probs_ith(ctx, idx) == nullptr) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        // the model's suppressed tokens carry a -inf bias in the chain
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+        llama_token best = -1;
+        float best_logit = -INFINITY;
+
+        // the device already picked the token (LLAMA_GPU_ARGMAX): no logits copy, no scan.
+        // Only without suppressed tokens, which the device argmax does not know about.
+        const llama_token device_best = n_suppress == 0 ? llama_get_argmax_ith(ctx, idx) : LLAMA_TOKEN_NULL;
+        if (device_best != LLAMA_TOKEN_NULL) {
+            best       = device_best;
+            best_logit = 0.0f; // not needed by greedy callers
+        } else {
+            const float * logits = llama_get_logits_ith(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            for (llama_token t = 0; t < n_vocab; ++t) {
+                if (logits[t] > best_logit) {
+                    bool suppressed = false;
+                    for (int32_t i = 0; i < n_suppress; ++i) {
+                        suppressed |= suppress[i] == t;
+                    }
+                    if (!suppressed) {
+                        best = t;
+                        best_logit = logits[t];
+                    }
+                }
+            }
+        }
+
+        bool ok = best >= 0;
+        if (ok && gsmpl->rbudget) {
+            // a reasoning budget that is forcing a token rejects everything else: fall back if so
+            llama_token_data       single       = { best, best_logit, 0.0f };
+            llama_token_data_array single_array = { &single, 1, -1, false };
+            llama_sampler_apply(gsmpl->rbudget, &single_array);
+            ok = single_array.data[0].logit != -INFINITY;
+        }
+
+        if (ok) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ best, best_logit, 1.0f };
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+            full_timing.path = device_best != LLAMA_TOKEN_NULL ? "gpu_argmax" : "cpu_greedy";
+            return best;
+        }
+    }
 
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
