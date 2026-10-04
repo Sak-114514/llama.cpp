@@ -644,7 +644,66 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+// [DENSE_DECODE_ONCE] sm_70 dense nc>1 path: the stock j/i loop re-enters the weight-side
+// decode (iq3s_grid lookups, sign masks, scale nibble, block d) once per token column, so at
+// nc5 the SASS census sees the IDP/LOP3 work with a x5 structure (sass-audit REPORT.md 2.2).
+// This variant decodes the weight block once per (row, k-block) into registers and then runs
+// the per-token q8 dot products against the decoded values. The per-token arithmetic (dp4a
+// accumulation order, integer scale multiply, d*ds*sumi) is kept identical to
+// vec_dot_iq3_s_q8_1, so each (token, row) accumulation chain is bit-identical to the stock
+// kernel. No repack, no format change; the nc1 path never instantiates decode_once.
+template <int ncols_dst, int rows_per_cuda_block>
+static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs,
+        const uint32_t & stride_col_y, float (&tmp)[ncols_dst][rows_per_cuda_block], const int & i) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int grid_v[8];
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        grid_v[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
+        grid_v[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+
+    const int   scale = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float dw    = __half2float(bq3->d);
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const block_q8_1 * bq8_1 = &y[j*stride_col_y + iqs/2];
+
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            sumi = ggml_cuda_dp4a(grid_v[l0 + 0], get_int_b4(bq8_1->qs, l0 + 0), sumi);
+            sumi = ggml_cuda_dp4a(grid_v[l0 + 1], get_int_b4(bq8_1->qs, l0 + 1), sumi);
+        }
+
+        sumi *= scale;
+
+        const float d = dw * __low2float(bq8_1->ds);
+        tmp[j][i] += d * sumi;
+    }
+}
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+          bool decode_once = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -786,16 +845,26 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        if constexpr (decode_once && !has_fusion && type == GGML_TYPE_IQ3_S && ncols_dst > 1) {
+            // [DENSE_DECODE_ONCE] row-major: decode the weight block once per (i, kbx), then
+            // accumulate all token columns against the decoded registers (see helper above).
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                vec_dot_iq3_s_q8_1_multi<ncols_dst, rows_per_cuda_block>(
+                    vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, tmp, i);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -1080,10 +1149,20 @@ static void mul_mat_vec_q_switch_fusion(
 
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
-        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    // [DENSE_DECODE_ONCE] unfused dense IQ3_S with more than one token column takes the
+    // decode-once inner loop (weight decode hoisted out of the token loop). Fused instances
+    // and ncols_dst == 1 keep the stock kernel.
+    if constexpr (type == GGML_TYPE_IQ3_S && c_ncols_dst > 1) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    }
 }
 
 // Volta IQ2_S MoE GEMV (optionally fused gate+up+SwiGLU). The generic path is bound by decode
