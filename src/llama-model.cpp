@@ -26,15 +26,18 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -372,6 +375,53 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+static bool llama_ple_shard_enabled(const llama_model * model) {
+    static const bool requested = [] {
+        const char * s = getenv("LLAMA_PLE_SHARD");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return requested && model != nullptr && model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+}
+
+static bool llama_ple_shard_rows_enabled(const llama_model * model) {
+    static const bool requested = [] {
+        const char * s = getenv("LLAMA_PLE_SHARD_ROWS");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return requested && llama_ple_shard_enabled(model);
+}
+
+// LLAMA_DRAFT_DETP=1: run the MTP draft head on a single device without tensor parallelism,
+// removing the per-layer AllReduce chain from every speculative draft forward. The draft-layer
+// weights are placed in full on one plain device during load_tensors (the draft layers are never
+// touched by the trunk graph, so the trunk is unaffected); the draft context picks the placement
+// up via llama_model::draft_detp_active(). Default off = today's tensor-parallel draft.
+static bool llama_draft_detp_requested() {
+    static const bool requested = [] {
+        const char * s = getenv("LLAMA_DRAFT_DETP");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return requested;
+}
+
+// LLAMA_DRAFT_DETP_RESERVE (MiB): free-memory the draft device must still hold after taking the
+// full draft weights and the LM-head replica, on top of the estimated trunk shard. Covers the
+// draft KV cache moving from 1/n-per-device split to whole-on-device, the single-device draft
+// compute buffers and CUDA graphs, and CUDA/NCCL context overhead.
+static size_t llama_draft_detp_reserve_bytes() {
+    static const size_t bytes = [] {
+        size_t mib = 2560;
+        if (const char * s = getenv("LLAMA_DRAFT_DETP_RESERVE")) {
+            const long v = atol(s);
+            if (v > 0) {
+                mib = (size_t) v;
+            }
+        }
+        return mib * 1024 * 1024;
+    }();
+    return bytes;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -421,6 +471,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
+    static const std::regex pattern_nextn_head   ("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
@@ -496,6 +547,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
+        }
+
+        // shared experts: split like the routed experts, so their partial sum joins the MoE AllReduce
+        if (is_dsv4 || ud->model->arch == LLM_ARCH_QWEN4EXP) {
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
@@ -592,10 +647,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
+        // the MTP draft head: split by vocab like output.weight (its logits are read back like the target's)
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP && std::regex_match(tensor_name, pattern_nextn_head)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+        }
+
+        if (llama_ple_shard_enabled(ud->model) && tensor_name == "per_layer_token_embd.weight") {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
 
         // everything else
@@ -757,6 +820,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    // Keep whole GQA groups with their KV heads. More devices than KV
+                    // heads can leave an empty member; equal Q-only shares are invalid.
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
@@ -800,8 +865,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+            // an even share the rounding would break up (640 on 4 devices: 128/128/128/256, and whichever device
+            // holds 256 sets the pace of every layer) is split at a finer multiple of the block size instead
+            static const bool keep_128 = getenv("LLAMA_SPLIT_FFN_128") != nullptr;
+            while (!keep_128 && segments[0].first % (blck_size_perf*(int64_t) ud->n_devices) != 0 &&
+                    blck_size_perf % 2 == 0 && (blck_size_perf/2) % blck_size == 0) {
+                blck_size_perf /= 2;
+            }
             return {blck_size_perf};
         }
 
@@ -814,13 +886,83 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
+    if (llama_ple_shard_enabled(ud->model) && tensor_name == "per_layer_token_embd.weight" &&
+            tc.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+        if (llama_ple_shard_rows_enabled(ud->model)) {
+            GGML_ASSERT(ud->n_devices > 0);
+            GGML_ASSERT(tensor->ne[0] == 160);
+            const int64_t total_rows = tensor->ne[1];
+            GGML_ASSERT(total_rows <= INT32_MAX);
+            int64_t low = 0;
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                const int64_t high = j + 1 == ud->n_devices ? total_rows :
+                    total_rows * (int64_t) (j + 1) / ud->n_devices;
+                split_state.ne[j] = high - low;
+                low = high;
+            }
+            GGML_ASSERT(low == total_rows);
+            split_state.nr[0] = 1;
+            split_state.n_segments = 1;
+            return split_state;
+        }
+
+        const size_t n_head_ple = hparams.ple_n_heads;
+        GGML_ASSERT(n_head_ple > 0 && n_head_ple <= 16);
+        GGML_ASSERT(ud->n_devices <= n_head_ple);
+
+        int64_t assigned = 0;
+        size_t  j_last   = 0;
+        for (size_t s = 0; s < n_head_ple; s++) {
+            const size_t j = s*ud->n_devices/n_head_ple;
+            split_state.ne[s*ud->n_devices + j] = (int64_t) hparams.ple_head_vocab_sizes[s];
+            split_state.nr[s] = 1;
+            assigned += (int64_t) hparams.ple_head_vocab_sizes[s];
+            j_last = j;
+        }
+        GGML_ASSERT(assigned <= tensor->ne[1]);
+        split_state.ne[(n_head_ple - 1)*ud->n_devices + j_last] += tensor->ne[1] - assigned;
+        split_state.n_segments = n_head_ple;
+        return split_state;
+    }
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+
+        // LLAMA_DRAFT_DETP asymmetric tensor split: entry k of tensor_split always weights
+        // physical device k (the per-layer rotation shifts scan slots and entries by the same
+        // offset, so it only spreads the rounding remainders), so scaling the draft device's
+        // ENTRY shrinks exactly that card's shard on every tensor. detp_trunk_w == 1.0f is a
+        // plain pass-through of the user's tensor_split.
+        const bool detp_scale = ud->detp_trunk_w != 1.0f && ud->detp_dev < ud->n_devices;
+        {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                std::string ts = tensor_split == nullptr ? "nullptr" : "[";
+                if (tensor_split != nullptr) {
+                    for (size_t k = 0; k < ud->n_devices; k++) ts += std::to_string(tensor_split[k]) + " ";
+                    ts += "]";
+                }
+                LLAMA_LOG_INFO("split-callback first call: n_devices=%zu tensor_split=%s detp_scale=%d trunk_w=%.3f detp_dev=%zu\n",
+                    ud->n_devices, ts.c_str(), (int) detp_scale, ud->detp_trunk_w, (size_t) ud->detp_dev);
+            }
+        }
+        std::vector<float> split_w;
+        if (detp_scale) {
+            split_w.resize(ud->n_devices);
+            for (size_t k = 0; k < ud->n_devices; k++) {
+                // with no --tensor-split given, use a uniform base so the weights take effect
+                split_w[k] = tensor_split == nullptr ? 1.0f : tensor_split[k];
+            }
+            split_w[ud->detp_dev] *= ud->detp_trunk_w;
+        }
+
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            const size_t k = (j + tc.rotation) % ud->n_devices;
+            tensor_split_scan.push_back(detp_scale ? split_w[k]
+                : (tensor_split == nullptr ? 0.0f : tensor_split[k]));
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -860,6 +1002,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
             }
         }
+    }
+    // LLAMA_CALLBACK_TRACE=N: log the first N split-state callback invocations (the v12/v13
+    // AC922 hunts showed the interesting divergence happens in later calls - rotation, second
+    // island - not in the clean first one). Prints name, island size, and per-member sums.
+    static std::atomic<int> n_traced {0};
+    static const int trace_limit = [] {
+        const char * s = getenv("LLAMA_CALLBACK_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+    if (trace_limit > 0 && n_traced.load(std::memory_order_relaxed) < trace_limit) {
+        n_traced.fetch_add(1, std::memory_order_relaxed);
+        std::string sums;
+        for (size_t j = 0; j < ud->n_devices; j++) {
+            int64_t sum = 0;
+            for (size_t s = 0; s < split_state.n_segments; s++) {
+                sum += split_state.ne[s*ud->n_devices + j] * split_state.nr[s];
+            }
+            sums += (j ? " " : "") + std::to_string(sum);
+        }
+        LLAMA_LOG_INFO("split callback #%d: %s n_devices=%zu axis=%d sums=[%s]\n",
+                n_traced.load(std::memory_order_relaxed), tensor_name.c_str(), ud->n_devices,
+                (int) split_state.axis, sums.c_str());
     }
     return split_state;
     GGML_UNUSED(userdata);
@@ -1204,6 +1368,9 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
 
+    // LLAMA_DRAFT_DETP: the NextN/MTP draft layers were placed in full on draft_detp_dev_candidate
+    bool detp_active = false;
+
     std::vector<float> tensor_split_owned;
 };
 
@@ -1480,6 +1647,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
     }
 
+    if (ple_device) {
+        if (arch != LLM_ARCH_QWEN4EXP || hparams.ple_n_heads == 0 || !llama_ple_shard_enabled(this)) {
+            throw std::runtime_error("separate PLE requires Qwen4exp GPU PLE");
+        }
+        pimpl->gpu_buft_list.emplace(ple_device, make_gpu_buft_list(ple_device, split_mode, nullptr));
+    }
+
+    // island invariant: every island must be its own device object with its own buffer type.
+    // Two islands sharing a device or a head buffer type would funnel every layer's tensors into
+    // one context (observed on AC922 as one island ctx holding the full GPU weight set) - the
+    // block counts would still look fine because the ownership check counts per device pointer,
+    // so verify identity here, where the failure is attributable.
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && devices.size() > 1) {
+        std::set<ggml_backend_dev_t> seen_devs;
+        std::set<ggml_backend_buffer_type_t> seen_bufts;
+        for (const auto & dev : devices) {
+            ggml_backend_buffer_type_t head_buft = ggml_backend_dev_buffer_type(dev.dev);
+            LLAMA_LOG_INFO("%s: island device %s: %p, buffer type %s: %p\n", __func__,
+                    ggml_backend_dev_name(dev.dev), (void *) dev.dev,
+                    ggml_backend_buft_name(head_buft), (void *) head_buft);
+            if (!seen_devs.insert(dev.dev).second) {
+                throw std::runtime_error(format(
+                    "%s: island-mode bug: device %s appears more than once in the device list - "
+                    "the meta devices were not created as distinct objects, refusing to load",
+                    __func__, ggml_backend_dev_name(dev.dev)));
+            }
+            if (!seen_bufts.insert(head_buft).second) {
+                throw std::runtime_error(format(
+                    "%s: island-mode bug: devices %s and another island share the buffer type %s (%p) - "
+                    "all layers would be loaded into one island's context, refusing to load",
+                    __func__, ggml_backend_dev_name(dev.dev), ggml_backend_buft_name(head_buft), (void *) head_buft));
+            }
+        }
+    }
+
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
@@ -1520,6 +1722,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+
+    // Island mode: LLAMA_SPLIT_MODE_TENSOR with several (meta) devices, i.e. LLAMA_ISLAND_SPLIT.
+    // The layer boundary between the islands is computed deterministically from LLAMA_ISLAND_LAYERS
+    // (default: half of the blocks) instead of the --tensor-split ratios or free-memory reports:
+    //   - a meta device reports the combined free memory of all its members, which the ratio math
+    //     above does not expect, and any member reporting 0 collapses every layer onto one island
+    //     (observed as a single ~2x-oversized cudaMalloc on one island member at load);
+    //   - --tensor-split entries [0..n_islands) double as the layer ratios while the split-state
+    //     callback uses entries [0..island_size) as the intra-island shard sizes, so in island mode
+    //     the intra-island weights are forced uniform here to keep the two meanings from aliasing.
+    const bool island_mode = split_mode == LLAMA_SPLIT_MODE_TENSOR && n_devices() > 1;
+    int island_layers = i_gpu_start + (act_gpu_layers + 1) / 2; // midpoint of the GPU-resident blocks
+    if (island_mode) {
+        if (const char * island_layers_env = getenv("LLAMA_ISLAND_LAYERS")) {
+            const int island_layers_env_val = atoi(island_layers_env);
+            if (island_layers_env_val > 0 && island_layers_env_val < n_layer_all) {
+                island_layers = island_layers_env_val;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring LLAMA_ISLAND_LAYERS=%s (must be in (0, %d)), using %d\n",
+                        __func__, island_layers_env, n_layer_all, island_layers);
+            }
+        }
+        if (act_gpu_layers > 0 && !devices.empty()) {
+            for (size_t i = 0; i < n_devices(); ++i) {
+                splits[i] = i == 0
+                    ? std::min(1.0f, std::max(0.0f, float(island_layers - i_gpu_start)/act_gpu_layers))
+                    : 1.0f;
+            }
+        }
+        if (get_split_state_ud.n_devices > 0) {
+            pimpl->tensor_split_owned.assign(get_split_state_ud.n_devices, 1.0f);
+            params.tensor_split = pimpl->tensor_split_owned.data();
+        }
+        LLAMA_LOG_INFO("%s: island mode: %zu islands of %zu devices, blocks 0..%d on island 0\n",
+                __func__, n_devices(), get_split_state_ud.n_devices, island_layers - 1);
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -1544,6 +1783,219 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    if (island_mode) {
+        // if the boundary collapsed, every block would land on one island and each of its members
+        // would have to hold the whole model's GPU weights (3x too much per card) - fail here with
+        // an attributable message instead of an out-of-memory cudaMalloc deep in the allocator
+        std::map<ggml_backend_dev_t, int> island_blocks;
+        for (int il = 0; il <= n_layer_all; ++il) {
+            const ggml_backend_dev_t dev = il == n_layer_all ? pimpl->dev_output.dev : pimpl->dev_layer[il].dev;
+            island_blocks[dev]++;
+        }
+        for (const auto & dev : devices) {
+            const int n_blocks = island_blocks[dev.dev];
+            LLAMA_LOG_INFO("%s: island %s owns %d blocks (incl. output/MTP)\n",
+                    __func__, ggml_backend_dev_name(dev.dev), n_blocks);
+            if (n_blocks == 0) {
+                throw std::runtime_error(format(
+                    "%s: island-mode bug: %s owns no blocks - all layers collapsed onto another island, refusing to load",
+                    __func__, ggml_backend_dev_name(dev.dev)));
+            }
+        }
+    }
+
+    // LLAMA_DRAFT_DETP=1: place the NextN/MTP draft layers in full (unsplit) on one plain device
+    // so an MTP draft context runs them without any tensor-parallel AllReduce. The trunk graph
+    // never touches layers >= n_layer(), so only the draft is affected. Falls back to the
+    // tensor-parallel draft whenever the device cannot hold the full draft set with a reserve.
+    if (llama_draft_detp_requested() && !ml.no_alloc) {
+        const uint32_t n_layer_trunk = hparams.n_layer();
+
+        bool detp_ok = split_mode == LLAMA_SPLIT_MODE_TENSOR
+            && !devices.empty() && devices[0].is_meta
+            && draft_detp_dev_candidate != nullptr
+            && get_split_state_ud.n_devices > 0
+            && hparams.n_layer_nextn > 0 && n_layer_trunk > 0
+            && hparams.router_layer < 0
+            && !pimpl->has_tensor_overrides
+            // the FreeToken MTP variants manage the draft-layer weights themselves
+            && getenv("GGML_FT_MTP_DENSE_FP8") == nullptr
+            && getenv("GGML_FT_MTP_NVFP4") == nullptr;
+
+        if (!detp_ok) {
+            LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP requested but not applicable (model/device configuration) - keeping the tensor-parallel draft\n", __func__);
+        }
+
+        // the de-TP draft set covers every repeating block from the first NextN layer on
+        size_t detp_nextn_bytes = 0;
+        for (const auto & [w_name, w] : ml.weights_map) {
+            int w_il = -1;
+            if (sscanf(w_name.c_str(), "blk.%d.", &w_il) == 1 && w_il >= (int) n_layer_trunk) {
+                detp_nextn_bytes += ggml_nbytes(w.tensor);
+            }
+        }
+        if (detp_nextn_bytes == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP: no draft-layer weights found in the file - keeping the tensor-parallel draft\n", __func__);
+            detp_ok = false;
+        }
+
+        // a dedicated per-block LM head is itself a draft-layer weight and gets re-placed with
+        // the block; only a missing one falls back to the (vocab-split, trunk-shared) output
+        bool detp_head_replica = true;
+        for (uint32_t il = n_layer_trunk; il < (uint32_t) n_layer_all; ++il) {
+            if (ml.get_weight(("blk." + std::to_string(il) + ".nextn.shared_head_head.weight").c_str()) != nullptr) {
+                detp_head_replica = false;
+            }
+        }
+        const auto * w_out   = detp_head_replica ? ml.get_weight("output.weight")       : nullptr;
+        const auto * w_out_s = detp_head_replica ? ml.get_weight("output.weight.scale") : nullptr;
+        if (detp_ok && detp_head_replica && w_out == nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP: no output.weight to replicate for the draft head - keeping the tensor-parallel draft\n", __func__);
+            detp_ok = false;
+        }
+        const size_t detp_head_bytes       = (w_out   != nullptr) ? ggml_nbytes(w_out->tensor)   : 0;
+        const size_t detp_head_scale_bytes = (w_out_s != nullptr) ? ggml_nbytes(w_out_s->tensor) : 0;
+
+        if (detp_ok) {
+            // asymmetric tensor split (LLAMA_DRAFT_DETP_TRUNK_W, applied in
+            // llama_meta_device_get_split_state and configured in llama.cpp): estimate every
+            // card's trunk share as trunk_total * unit_i / sum(units) - the same proportional
+            // math as the split callback's cumulative division (cf. upstream llama.cpp splits)
+            const size_t n_phys = devices.size() * get_split_state_ud.n_devices;
+            const size_t trunk_total = ml.n_bytes > detp_nextn_bytes ? ml.n_bytes - detp_nextn_bytes : 0;
+
+            const float w_trunk   = get_split_state_ud.detp_trunk_w;
+            const size_t detp_idx = get_split_state_ud.detp_dev;
+
+            float sum_units = 0.0f;
+            float unit_max_other = 0.0f;
+            float unit_detp = 0.0f;
+            for (size_t j = 0; j < n_phys; j++) {
+                const float base = tensor_split ? tensor_split[j] : 1.0f;
+                const float unit = j == detp_idx ? base * w_trunk : base;
+                sum_units += unit;
+                if (j == detp_idx) {
+                    unit_detp = unit;
+                } else {
+                    unit_max_other = std::max(unit_max_other, unit);
+                }
+            }
+
+            // +8% for split-rounding / granularity remainders (the per-layer rotation spreads
+            // the rounding remainders, but the largest chunk can sit on any non-draft card)
+            const size_t share_detp = sum_units > 0.0f ? (size_t) (trunk_total * unit_detp / sum_units * 1.08f) : 0;
+            const size_t share_other = sum_units > 0.0f ? (size_t) (trunk_total * unit_max_other / sum_units * 1.08f) : 0;
+
+            const size_t need_detp = share_detp + detp_nextn_bytes + detp_head_bytes + detp_head_scale_bytes
+                + llama_draft_detp_reserve_bytes();
+            // the other cards keep their usual KV cache and compute buffers; 512 MiB covers the
+            // extra headroom they lose to the asymmetric shift
+            const size_t need_other = share_other + 512ull * 1024 * 1024;
+
+            size_t dev_free = 0, dev_total = 0;
+            ggml_backend_dev_memory(draft_detp_dev_candidate, &dev_free, &dev_total);
+
+            if (dev_free < need_detp) {
+                LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP disabled: draft device %s would need ~%.2f GiB "
+                        "(trunk share %.2f + draft %.2f + head %.2f + reserve) but has only %.2f GiB free - keeping the tensor-parallel draft "
+                        "(the asymmetric tensor-split weights remain in effect)\n",
+                        __func__, ggml_backend_dev_name(draft_detp_dev_candidate),
+                        need_detp / 1024.0 / 1024.0 / 1024.0,
+                        share_detp / 1024.0 / 1024.0 / 1024.0,
+                        detp_nextn_bytes / 1024.0 / 1024.0 / 1024.0,
+                        (detp_head_bytes + detp_head_scale_bytes) / 1024.0 / 1024.0 / 1024.0,
+                        dev_free / 1024.0 / 1024.0 / 1024.0);
+                detp_ok = false;
+            }
+
+            // the non-draft cards take over the weight the draft card shed - check the fullest one
+            for (size_t j = 0; detp_ok && j < n_phys && j < draft_detp_devs.size(); j++) {
+                if (j == detp_idx || draft_detp_devs[j] == draft_detp_dev_candidate) {
+                    continue;
+                }
+                size_t free_j = 0, total_j = 0;
+                ggml_backend_dev_memory(draft_detp_devs[j], &free_j, &total_j);
+                if (free_j < need_other) {
+                    LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP disabled: %s would need ~%.2f GiB under the asymmetric split "
+                            "but has only %.2f GiB free - keeping the tensor-parallel draft "
+                            "(the asymmetric tensor-split weights remain in effect)\n",
+                            __func__, ggml_backend_dev_name(draft_detp_devs[j]),
+                            need_other / 1024.0 / 1024.0 / 1024.0,
+                            free_j / 1024.0 / 1024.0 / 1024.0);
+                    detp_ok = false;
+                }
+            }
+        }
+
+        if (detp_ok) {
+            auto * detp_dev = draft_detp_dev_candidate;
+
+            // plain-device buffer-type list for the draft layers, built like the other devices'
+            buft_list_t detp_buft_list = make_gpu_buft_list(detp_dev, split_mode, tensor_split);
+            detp_buft_list.insert(detp_buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+            pimpl->gpu_buft_list.emplace(detp_dev, std::move(detp_buft_list));
+            buft_list_t * detp_buft_list_ptr = &pimpl->gpu_buft_list.at(detp_dev);
+
+            std::vector<llama_model::impl::layer_dev> detp_dev_layer_prev;
+            detp_dev_layer_prev.reserve(n_layer_all - n_layer_trunk);
+            for (uint32_t il = n_layer_trunk; il < (uint32_t) n_layer_all; ++il) {
+                detp_dev_layer_prev.push_back(pimpl->dev_layer[il]);
+                pimpl->dev_layer[il] = { detp_dev, detp_buft_list_ptr };
+            }
+
+            // reserve the LM-head replica up front, before the main weight pass can take the memory
+            if (detp_head_replica) {
+                ggml_init_params ip = {
+                    /*.mem_size   =*/ ggml_tensor_overhead() * 4,
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr detp_ctx { ggml_init(ip) };
+                ggml_backend_buffer_t detp_buf = nullptr;
+
+                if (detp_ctx) {
+                    output_detp = ggml_dup_tensor(detp_ctx.get(), w_out->tensor);
+                    ggml_set_name(output_detp, "output_detp.weight");
+                    if (w_out_s) {
+                        output_detp_s = ggml_dup_tensor(detp_ctx.get(), w_out_s->tensor);
+                        ggml_set_name(output_detp_s, "output_detp.weight.scale");
+                    }
+                    detp_buf = ggml_backend_alloc_ctx_tensors_from_buft(detp_ctx.get(), ggml_backend_dev_buffer_type(detp_dev));
+                }
+
+                if (detp_buf == nullptr) {
+                    LLAMA_LOG_WARN("%s: LLAMA_DRAFT_DETP disabled: failed to reserve the LM-head replica on %s - keeping the tensor-parallel draft\n",
+                            __func__, ggml_backend_dev_name(detp_dev));
+                    output_detp   = nullptr;
+                    output_detp_s = nullptr;
+                    detp_ok = false;
+                } else {
+                    // the replica is filled from the loaded output weight after load_all_data
+                    ggml_backend_buffer_set_usage(detp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                    std::vector<ggml_backend_buffer_ptr> detp_bufs;
+                    detp_bufs.emplace_back(detp_buf);
+                    pimpl->ctxs_bufs.emplace_back(std::move(detp_ctx), std::move(detp_bufs));
+                }
+            }
+
+            if (!detp_ok) {
+                // revert the draft-layer placement, the draft stays on the meta device
+                for (uint32_t il = n_layer_trunk; il < (uint32_t) n_layer_all; ++il) {
+                    pimpl->dev_layer[il] = detp_dev_layer_prev[il - n_layer_trunk];
+                }
+                pimpl->gpu_buft_list.erase(detp_dev);
+            } else {
+                pimpl->detp_active = true;
+                LLAMA_LOG_INFO("%s: LLAMA_DRAFT_DETP active: draft layers %u..%d in full on %s (draft weights %.2f GiB, LM-head replica %.2f GiB, asymmetric trunk weight %.3f)\n",
+                        __func__, n_layer_trunk, n_layer_all - 1, ggml_backend_dev_name(detp_dev),
+                        detp_nextn_bytes / 1024.0 / 1024.0 / 1024.0,
+                        (detp_head_bytes + detp_head_scale_bytes) / 1024.0 / 1024.0 / 1024.0,
+                        get_split_state_ud.detp_trunk_w);
+            }
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1718,6 +2170,75 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     ml.done_getting_tensors();
 
+
+    if (island_mode) {
+        // pre-flight check before any device allocation: sum the tensor bytes destined for each
+        // island and compare against the island's combined free memory. A mis-split island (e.g.
+        // all blocks on one island, or intra-island shards that did not shrink the per-member
+        // footprint) shows up here with numbers, instead of as a cudaMalloc OOM.
+        for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            ggml_backend_buffer_type_t buft = ctx_key.buft;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) {
+                continue;
+            }
+            ggml_context * ctx = ctx_ptr.get();
+            size_t n_tensors = 0;
+            size_t n_bytes   = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                n_tensors++;
+                n_bytes += ggml_nbytes(t);
+            }
+            if (n_tensors == 0) {
+                continue;
+            }
+            // the split-state userdata is shared by all islands; if it disagrees with this
+            // island's member count the per-member slices are silently mis-sized (the sums
+            // still check out, so the allocator only fails much later with an oversized
+            // per-member cudaMalloc) - fail here instead, at the attributable place
+            const size_t n_members = ggml_backend_meta_device_n_devices(dev);
+            const size_t expected_members = dev == ple_device ? n_members : get_split_state_ud.n_devices;
+            if (expected_members > 0 && n_members != expected_members) {
+                throw std::runtime_error(format(
+                    "%s: island %s has %zu members but the shared split-state userdata assumes %zu - "
+                    "the intra-island shard sizes would be wrong, refusing to load",
+                    __func__, ggml_backend_dev_name(dev), n_members, get_split_state_ud.n_devices));
+            }
+            size_t dev_free = 0, dev_total = 0;
+            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+            // v10 diagnostics: the island aggregate free memory is the sum over its members; a
+            // wrong sum (observed once after the vLLM-induced freeze: one member's value instead
+            // of three) is either a member-enumeration problem (creation side) or per-member
+            // query failures returning 0/0. Print the breakdown to distinguish the two at once.
+            {
+                std::string members_info;
+                for (size_t m = 0; m < n_members; m++) {
+                    ggml_backend_dev_t member = ggml_backend_meta_device_member(dev, m);
+                    size_t m_free = 0, m_total = 0;
+                    ggml_backend_dev_memory(member, &m_free, &m_total);
+                    members_info += format("%s(%.2f GiB free) ", ggml_backend_dev_name(member),
+                            m_free / 1024.0 / 1024.0 / 1024.0);
+                }
+                LLAMA_LOG_INFO("%s: island %s aggregate free %.2f GiB over %zu members (expected %zu): %s\n",
+                        __func__, ggml_backend_dev_name(dev), dev_free / 1024.0 / 1024.0 / 1024.0,
+                        n_members, expected_members, members_info.c_str());
+            }
+            LLAMA_LOG_INFO("%s: island %s (buft %s: %p): %zu tensors, %.2f GiB total (~%.2f GiB per member), island free %.2f GiB\n",
+                    __func__, ggml_backend_dev_name(dev), ggml_backend_buft_name(buft), (void *) buft, n_tensors,
+                    n_bytes / 1024.0 / 1024.0 / 1024.0,
+                    n_bytes / (double) n_members / 1024.0 / 1024.0 / 1024.0,
+                    dev_free / 1024.0 / 1024.0 / 1024.0);
+            if (n_bytes > dev_free - dev_free / 10) {
+                throw std::runtime_error(format(
+                    "%s: island %s is asked to hold %.2f GiB but its members report only %.2f GiB free in total - "
+                    "the block/island assignment or the intra-island shard sizes are wrong, refusing to allocate",
+                    __func__, ggml_backend_dev_name(dev), n_bytes / 1024.0 / 1024.0 / 1024.0,
+                    dev_free / 1024.0 / 1024.0 / 1024.0));
+            }
+        }
+    }
+
+
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
@@ -1731,7 +2252,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    if (ple_device) {
+        std::map<ggml_backend_dev_t, size_t> required;
+        for (auto & [key, ctx] : ml.ctx_map) {
+            auto * dev = ggml_backend_buft_get_device(key.buft);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) continue;
+            const size_t members = ggml_backend_meta_device_n_devices(dev);
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                const auto state = dev == ple_device ? llama_ple_device_split(t, this) : llama_meta_device_get_split_state(t, &get_split_state_ud);
+                for (size_t j = 0; j < members; ++j) {
+                    size_t bytes = ggml_nbytes(t);
+                    if (state.axis >= 0 && state.axis < GGML_MAX_DIMS) {
+                        int64_t extent = 0;
+                        for (size_t k = 0; k < state.n_segments; ++k) extent += state.ne[k * members + j] * state.nr[k];
+                        GGML_ASSERT(t->ne[state.axis] > 0);
+                        bytes = bytes * extent / t->ne[state.axis];
+                    }
+                    required[ggml_backend_meta_device_member(dev, j)] += bytes + 512;
+                }
+            }
+        }
+        for (const auto & [dev, weights] : required) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            const size_t reserve = 2ull * 1024 * 1024 * 1024;
+            LLAMA_LOG_INFO("%s: PLE combined budget %s weights %.2f GiB, free %.2f GiB, runtime room %.2f GiB\n",
+                    __func__, ggml_backend_dev_name(dev), weights / 1073741824.0, free / 1073741824.0,
+                    (double(free) - weights) / 1073741824.0);
+            if (weights + reserve > free) throw std::runtime_error("separate PLE lacks 2 GiB/card runtime reserve");
+        }
+    }
+
+    const char * prefetch_env = getenv("LLAMA_LOAD_PREFETCH");
+    const bool prefetch = prefetch_env == nullptr || atoi(prefetch_env) != 0;
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1873,6 +2427,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (pimpl->detp_active && output_detp != nullptr) {
+        // fill the de-TP LM-head replica now that the (vocab-split) output weight is loaded;
+        // one-time full copy, staged through host memory by ggml_backend_tensor_copy
+        GGML_ASSERT(output != nullptr);
+        LLAMA_LOG_INFO("%s: LLAMA_DRAFT_DETP: copying the LM head to the draft device (%.2f MiB)\n",
+                __func__, ggml_nbytes(output_detp) / 1024.0 / 1024.0);
+        ggml_backend_tensor_copy(output, output_detp);
+        if (output_s != nullptr && output_detp_s != nullptr) {
+            ggml_backend_tensor_copy(output_s, output_detp_s);
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1884,8 +2450,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
+    if (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && llama_ple_shard_enabled(this) &&
+            !pimpl->dev_layer.empty()) {
+        buft_list_input = ple_device ? &pimpl->gpu_buft_list.at(ple_device) : pimpl->dev_layer[0].buft_list;
+        flags &= ~llama_model_loader::TENSOR_READ_LAZY;
+    }
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
@@ -2176,6 +2748,14 @@ void llama_model::print_info() const {
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
+}
+
+bool llama_model::draft_detp_active() const {
+    return pimpl->detp_active;
+}
+
+ggml_backend_dev_t llama_model::draft_detp_dev() const {
+    return pimpl->detp_active ? draft_detp_dev_candidate : nullptr;
 }
 
 ggml_backend_dev_t llama_model::dev_output() const {
@@ -2589,6 +3169,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        filter_idx = filter_attn;
+                        filter_recr = [&](uint32_t) { return false; };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -2767,6 +3353,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+
+    // device-side greedy argmax (if enabled)
+    llm->build_argmax();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers

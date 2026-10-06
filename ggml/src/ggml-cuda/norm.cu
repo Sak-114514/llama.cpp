@@ -154,6 +154,55 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// RMS_NORM followed by SCALE (no bias): same arithmetic as the two kernels, (1/rms * x) * s
+template <int block_size>
+static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float s) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float y = scale * x[col];
+        dst[col] = y * s;
+    }
+}
+
+void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * rms, ggml_tensor * scale_node) {
+    const ggml_tensor * src0 = rms->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    float eps, s;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    memcpy(&s, scale_node->op_params, sizeof(float));
+    const int64_t s01 = src0->nb[1] / sizeof(float);
+    const int64_t s02 = src0->nb[2] / sizeof(float);
+    const int64_t s03 = src0->nb[3] / sizeof(float);
+    const dim3 blocks_num(src0->ne[1], src0->ne[2], src0->ne[3]);
+    if (src0->ne[0] < 1024) {
+        rms_norm_scale_f32<256><<<blocks_num, 256, 32*sizeof(float), ctx.stream()>>>(
+            (const float *) src0->data, (float *) scale_node->data, src0->ne[0], s01, s02, s03, eps, s);
+    } else {
+        rms_norm_scale_f32<1024><<<blocks_num, 1024, 32*sizeof(float), ctx.stream()>>>(
+            (const float *) src0->data, (float *) scale_node->data, src0->ne[0], s01, s02, s03, eps, s);
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -695,4 +744,83 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// RMS_NORM -> MUL(weight) -> MUL(., SIGMOID(z)) (a gated norm), one block of 256 threads per row as rms_norm_f32, so the
+// rms is bit-identical; then sigmoid(z) * ((1/rms * x) * w) as the two fused kernels compute it. Optionally writes the
+// result quantized to q8_1 for the GEMV that reads it (rows of ne10 without padding).
+static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x, const float * w, const float * z, float * dst,
+        const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        block_q8_1 * yq, const int64_t ne10) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x += sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t o = ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += 256) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += 256) {
+        const float n  = scale * x[col] * w[col];
+        const float zi = z[o + col];
+        const float v  = (1.0f / (1.0f + expf(-zi))) * n;
+        dst[o + col] = v;
+        if (yq != nullptr) {
+            // ncols <= 256 and ncols % 32 == 0: every warp holds whole quant blocks of the flat output
+            float amax = fabsf(v);
+            float sum  = v;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+            const int64_t f = o + col; // flat index; rows of ne10 without padding
+            yq[f / QK8_1].qs[f % QK8_1] = q;
+            if (f % QK8_1 == 0) {
+                yq[f / QK8_1].ds = make_half2(d, sum);
+            }
+        }
+    }
+    GGML_UNUSED(ne10);
+}
+
+bool ggml_cuda_rms_norm_gate_match(const ggml_tensor * rms, const ggml_tensor * mul, const ggml_tensor * sig, const ggml_tensor * out) {
+    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || sig->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || out->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const ggml_tensor * z = sig->src[0];
+    if (!((mul->src[0] == rms) != (mul->src[1] == rms)) ||
+            !((out->src[0] == mul && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul))) {
+        return false;
+    }
+    return x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 &&
+        x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_nrows(w) == 1 && w->ne[0] == x->ne[0] &&
+        ggml_is_contiguous(z) && ggml_is_contiguous(out) && ggml_are_same_shape(z, out) && ggml_are_same_shape(x, out) &&
+        x->ne[0] <= 256;
+}
+
+void ggml_cuda_op_rms_norm_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms, ggml_tensor * mul, ggml_tensor * sig,
+        ggml_tensor * out, block_q8_1 * yq, int64_t ne10) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const dim3 blocks(x->ne[1], x->ne[2], x->ne[3]);
+    rms_norm_mul_sigmoid_gate_f32<<<blocks, 256, 32*sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, (const float *) w->data, (const float *) sig->src[0]->data, (float *) out->data,
+        x->ne[0], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float), eps, yq, ne10);
 }

@@ -487,6 +487,88 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// [SM70_BF16_PREFILL_F16] strata-engine #540: saturated conversions for cuBLAS F16-compute GEMM operands
+// (ggml_get_to_fp16_sat_cuda, wired in batched_mul_mat_traits<GGML_TYPE_F16> only - flash attention / conv
+// keep the unsaturated kernels). A finite input beyond F16's max (65504) clamps instead of becoming Inf and
+// then NaN inside the product; Inf/NaN inputs pass through unchanged so a genuine upstream non-finite stays
+// visible. Values inside F16's range are bit-identical to convert_unary (same float round-trip, same rn).
+static __device__ __forceinline__ float f16_sat(float f) {
+    if (f >  65504.0f && !isinf(f)) return  65504.0f;
+    if (f < -65504.0f && !isinf(f)) return -65504.0f;
+    return f;
+}
+
+template <typename src_t>
+static __global__ void convert_unary_sat(
+        const void * __restrict__ vx, half * __restrict__ y, const int64_t ne00, const int64_t ne01,
+        const int64_t ne0203, const uint3 ne02,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t i00 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    const src_t * x = (const src_t *) vx;
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ix = i03*s03 + i02*s02 + i01*s01 + i00;
+            const int64_t iy = (i0203*ne01 + i01)*ne00 + i00;
+            y[iy] = __float2half_rn(f16_sat(ggml_cuda_cast<float>(x[ix])));
+        }
+    }
+}
+
+template <typename src_t>
+static __global__ void convert_unary_cont_sat_vec4(
+        const void * __restrict__ vx, half * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+    cvt_vec4<half> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = __float2half_rn(f16_sat(ggml_cuda_cast<float>(xv.v[j])));
+    }
+
+    ((cvt_vec4<half> *) y)[i] = yv;
+}
+
+template <typename src_t>
+static void convert_unary_sat_cuda(const void * vx, half * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
+    convert_unary_sat<src_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
+        (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+template <typename src_t>
+static void convert_unary_cont_sat_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<half>) == 0) {
+        const int64_t k4 = k/4;
+        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_sat_vec4<src_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        return;
+    }
+
+    convert_unary_sat_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -683,6 +765,32 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return convert_unary_cuda<nv_bfloat16>;
         default:
             return nullptr;
+    }
+}
+
+// [SM70_BF16_PREFILL_F16 / strata #540] saturated F16 conversion for cuBLAS F16-compute GEMM operands only.
+// F32/BF16 inputs can exceed F16's finite range, so they clamp to +-65504 (finite values only; Inf/NaN pass
+// through). Quantized formats are bounded inside F16's range by construction (their scales are the F16/F32
+// block maxima), F16 inputs are not converted at all -> everything else reuses the unsaturated dispatch.
+to_fp16_cuda_t ggml_get_to_fp16_sat_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return convert_unary_cont_sat_cuda<float>;
+        case GGML_TYPE_BF16:
+            return convert_unary_cont_sat_cuda<nv_bfloat16>;
+        default:
+            return ggml_get_to_fp16_cuda(type);
+    }
+}
+
+to_fp16_nc_cuda_t ggml_get_to_fp16_sat_nc_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return convert_unary_sat_cuda<float>;
+        case GGML_TYPE_BF16:
+            return convert_unary_sat_cuda<nv_bfloat16>;
+        default:
+            return ggml_get_to_fp16_nc_cuda(type);
     }
 }
 

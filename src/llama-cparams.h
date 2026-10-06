@@ -12,6 +12,9 @@ struct llama_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
+    uint32_t n_ft_native_moe; // experimental global native expert slots
+    uint32_t n_moe_expert_cache;   // GPU-resident MoE expert slots per tensor (0 = disabled)
+    uint32_t n_moe_expert_inserts; // promotions per tensor per step
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
@@ -35,6 +38,9 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool gpu_argmax;              // LLAMA_GPU_ARGMAX
+    uint32_t argmax_n_dev = 1;    // tensor split: logits are split by vocab over this many devices, see ggml_argmax_split
+    bool draft_detp = false;      // LLAMA_DRAFT_DETP: this MTP context runs the draft head on a single device (full logits, no vocab split)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

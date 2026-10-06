@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-moe-cache.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -115,6 +116,14 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    bool configure_mtp_gpu_carry(int32_t rows);
+    void reuse_mtp_gpu_carry(bool value);
+    bool mtp_gpu_carry_ready() const;
+    bool configure_mtp_gpu_chain();
+    void begin_mtp_gpu_chain();
+    void abort_mtp_gpu_chain();
+    int32_t end_mtp_gpu_chain(llama_token * tokens, int32_t capacity);
+    llama_token inspect_mtp_gpu_chain_step(int32_t step, bool audit);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -228,6 +237,23 @@ private:
 
     void output_reorder();
 
+    // LLAMA_GPU_ARGMAX: logits rows whose device-to-host copy is deferred until someone reads them
+    struct logits_pending_copy {
+        ggml_tensor *  t;
+        ggml_backend_t backend;
+        float *        dst;
+        size_t         nbytes;
+    };
+    std::vector<logits_pending_copy> logits_pending;
+    std::vector<int32_t>             argmax_ids; // per output row, -1 when not computed
+    void logits_flush(bool sync);
+
+public:
+    // greedy token of output i computed on the device, or LLAMA_TOKEN_NULL
+    llama_token get_argmax_ith(int32_t i);
+
+private:
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -303,6 +329,22 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    ggml_context_ptr mtp_carry_ctx;
+    ggml_backend_buffer_ptr mtp_carry_buf;
+    ggml_tensor * mtp_carry_input = nullptr;
+    ggml_tensor * mtp_chain_tokens = nullptr;
+    ggml_backend_buffer_ptr mtp_chain_tokens_buf;
+    ggml_tensor * mtp_chain_embedding = nullptr;
+    ggml_backend_buffer_ptr mtp_chain_embedding_buf;
+    ggml_backend_buffer_ptr mtp_chain_host;
+    bool mtp_chain_active = false;
+    bool mtp_chain_attempted = false;
+    int32_t mtp_chain_count = 0;
+    bool mtp_carry_keep = false;
+    bool mtp_carry_ready = false;
+    logits_pending_copy mtp_hidden_pending = {nullptr, nullptr, nullptr, 0};
+    void mtp_hidden_flush();
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
@@ -347,6 +389,10 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // GPU-resident cache for host-offloaded MoE experts (null when --moe-expert-cache is 0)
+    std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<class llama_ft_moe> ft_moe;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -373,6 +419,9 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // false while work enqueued on the backends may still be running (see synchronize())
+    bool synced = true;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

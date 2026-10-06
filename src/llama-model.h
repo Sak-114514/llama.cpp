@@ -231,6 +231,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // qwen4exp: the MTP head's own final hyper-connection mixer, which stands in for both
+    // the stream collapse and the output norm (the trunk has no separate output_norm either)
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -605,9 +611,17 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+
+    // LLAMA_DRAFT_DETP asymmetric tensor split: physical device `detp_dev` (the de-TP draft
+    // card) gets its trunk shard multiplied by `detp_trunk_w` (LLAMA_DRAFT_DETP_TRUNK_W, default
+    // 0.5), leaving room for the full draft weights and the LM-head replica on that one card.
+    // detp_trunk_w == 1.0f (the default) reproduces the plain --tensor-split semantics exactly.
+    float                      detp_trunk_w = 1.0f;
+    size_t                     detp_dev     = 0;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+struct ggml_backend_meta_split_state llama_ple_device_split(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
@@ -638,6 +652,12 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
+
+    // LLAMA_DRAFT_DETP=1: full single-device replica of the LM head for the de-TP MTP draft
+    // context. Used by the MTP graph only when the MTP block ships no dedicated
+    // nextn.shared_head_head weight and would otherwise fall back to the vocab-split output.
+    struct ggml_tensor * output_detp   = nullptr;
+    struct ggml_tensor * output_detp_s = nullptr;
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
@@ -705,6 +725,7 @@ struct llama_model {
 
     // list of devices used in this model
     std::vector<llama_device> devices;
+    ggml_backend_dev_t ple_device = nullptr;
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
@@ -745,6 +766,21 @@ struct llama_model {
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
+
+    // LLAMA_DRAFT_DETP=1: true when the NextN/MTP draft layers were placed in full (unsplit)
+    // on a single plain device, so an MTP draft context can run them without tensor parallelism
+    bool draft_detp_active() const;
+
+    // the plain device hosting the de-TP draft layers (null when inactive)
+    ggml_backend_dev_t draft_detp_dev() const;
+
+    // plain (non-meta) device recorded when the tensor-parallel meta devices are created;
+    // candidate host for the de-TP draft layers (LLAMA_DRAFT_DETP_DEV selects the index)
+    ggml_backend_dev_t draft_detp_dev_candidate = nullptr;
+
+    // the full plain-device list behind the (single) meta device, in tensor_split order;
+    // lets the de-TP load-time memory check probe every card's free memory
+    std::vector<ggml_backend_dev_t> draft_detp_devs;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
 
