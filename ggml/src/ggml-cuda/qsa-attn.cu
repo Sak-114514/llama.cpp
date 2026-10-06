@@ -397,21 +397,21 @@ void ggml_cuda_qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int    per  = (n_wblk + n_split - 1) / n_split;
     const size_t smem = (size_t) per*(sizeof(int32_t) + QSA_ATTN_R*sizeof(float));
     const bool   v_q4 = v->type == GGML_TYPE_Q4_0;
-#define QSA_LAUNCH(HPW, NGRP) qsa_attn_kernel<HPW, NGRP, v_q4><<<grid, block, smem, stream>>>( \
+#define QSA_LAUNCH(HPW, NGRP, VQ4) qsa_attn_kernel<HPW, NGRP, VQ4><<<grid, block, smem, stream>>>( \
         (const char *) q->data, (const char *) k->data, (const char *) v->data, (const half *) m->data, \
         (const int32_t *) ids->data, (float *) dst->data, part_acc.ptr, part_ml.ptr, \
         n_head, gqa, n_wblk, n_split, q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], \
         m->nb[3], ids->nb[1], scale)
-    if      (hpw == 3 && n_grp == 8) { QSA_LAUNCH(3, 8); }
-    else if (hpw == 3 && n_grp == 4) { QSA_LAUNCH(3, 4); }
-    else if (hpw == 3 && n_grp == 2) { QSA_LAUNCH(3, 2); }
-    else if (hpw == 3 && n_grp == 1) { QSA_LAUNCH(3, 1); }
-    else if (hpw == 4 && n_grp == 1) { QSA_LAUNCH(4, 1); }
-    else if (hpw == 4 && n_grp == 2) { QSA_LAUNCH(4, 2); }
-    else if (hpw == 4 && n_grp == 4) { QSA_LAUNCH(4, 4); }
-    else if (hpw == 2 && n_grp == 4) { QSA_LAUNCH(2, 4); }
-    else if (hpw == 2 && n_grp == 1) { QSA_LAUNCH(2, 1); }
-    else if (hpw == 1 && n_grp == 1) { QSA_LAUNCH(1, 1); }
+    if      (hpw == 3 && n_grp == 8) { if (v_q4) { QSA_LAUNCH(3, 8, true); } else { QSA_LAUNCH(3, 8, false); } }
+    else if (hpw == 3 && n_grp == 4) { if (v_q4) { QSA_LAUNCH(3, 4, true); } else { QSA_LAUNCH(3, 4, false); } }
+    else if (hpw == 3 && n_grp == 2) { if (v_q4) { QSA_LAUNCH(3, 2, true); } else { QSA_LAUNCH(3, 2, false); } }
+    else if (hpw == 3 && n_grp == 1) { if (v_q4) { QSA_LAUNCH(3, 1, true); } else { QSA_LAUNCH(3, 1, false); } }
+    else if (hpw == 4 && n_grp == 1) { if (v_q4) { QSA_LAUNCH(4, 1, true); } else { QSA_LAUNCH(4, 1, false); } }
+    else if (hpw == 4 && n_grp == 2) { if (v_q4) { QSA_LAUNCH(4, 2, true); } else { QSA_LAUNCH(4, 2, false); } }
+    else if (hpw == 4 && n_grp == 4) { if (v_q4) { QSA_LAUNCH(4, 4, true); } else { QSA_LAUNCH(4, 4, false); } }
+    else if (hpw == 2 && n_grp == 4) { if (v_q4) { QSA_LAUNCH(2, 4, true); } else { QSA_LAUNCH(2, 4, false); } }
+    else if (hpw == 2 && n_grp == 1) { if (v_q4) { QSA_LAUNCH(2, 1, true); } else { QSA_LAUNCH(2, 1, false); } }
+    else if (hpw == 1 && n_grp == 1) { if (v_q4) { QSA_LAUNCH(1, 1, true); } else { QSA_LAUNCH(1, 1, false); } }
     else { GGML_ABORT("qsa attention: unsupported head grouping %d x %d", hpw, n_grp); }
 #undef QSA_LAUNCH
     CUDA_CHECK(cudaGetLastError());
