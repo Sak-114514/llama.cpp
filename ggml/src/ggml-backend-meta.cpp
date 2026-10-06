@@ -968,7 +968,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
                 return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             }
             GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
-            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
+            // MWE (LLAMA_MWE_ATTN): with the block-cache K/V views mirrored every member
+            // runs the same block list against its full local K/V copy; q stays split
+            GGML_ASSERT((src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) ||
+                    (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED));
             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
         }
 

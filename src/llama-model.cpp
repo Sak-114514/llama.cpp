@@ -474,6 +474,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_nextn_head   ("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
+    // MWE (member workload equalization, LLAMA_MWE_ATTN=1): the full attention layers of
+    // QWEN4EXP have fewer KV heads than island members, so the whole-GQA-group split leaves
+    // one member with zero attention work (the 64K nsys shows one B island member running no
+    // flash_attn kernel at all, waiting at the AR). MWE mirrors the K/V side of those layers
+    // and spreads the Q heads across the members in equal per-KV-head slots (built where the
+    // split state is assigned below), so every member carries n_head/n_devices Q heads and
+    // the kernels' local GQA lookup still lands on the right KV head. Default off: the
+    // mirrored caches add ~1.5GiB per member at a 132K context.
+    static const bool mwe_attn_enabled = [] {
+        const char * e = getenv("LLAMA_MWE_ATTN");
+        return e && atoi(e) != 0;
+    }();
+    auto mwe_attn_layer = [&](uint32_t il) -> bool {
+        if (!mwe_attn_enabled || ud->model->arch != LLM_ARCH_QWEN4EXP || hparams.is_recr(il)) {
+            return false;
+        }
+        const uint32_t n_head    = hparams.n_head(il);
+        const uint32_t n_head_kv = hparams.n_head_kv(il);
+        return ud->n_devices >= 3 && n_head_kv < ud->n_devices &&
+            n_head % ud->n_devices == 0 && n_head / ud->n_devices % n_head_kv == 0;
+    };
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -885,7 +907,41 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
-    split_state.axis = tc.axis;
+    // MWE: every member holds every KV head of the full attention layers (the K/V projections
+    // and both cache instances match pattern_kv_cache), so a member can attend for Q heads of
+    // any GQA group
+    if (mwe_attn_layer(tc.il) && (std::regex_match(tensor_name, pattern_kv_weight) ||
+                                  std::regex_match(tensor_name, pattern_kv_cache))) {
+        split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    } else {
+        split_state.axis = tc.axis;
+    }
+    // MWE: spread the Q heads (and with them the matching contraction rows of the output
+    // projection) so member m takes the m-th equal slice of EVERY KV head's GQA group.
+    // Segment (g, m) is that slice of KV head g's Q heads, assigned to member m: with the
+    // K/V side mirrored above, each member's local q_head/gqa lookup lands on the KV head
+    // those Q heads belong to, so no kernel or graph changes are needed. wq's rows are
+    // interleaved [q|gate] per head (2*n_embd_head_k rows), attn_output's contraction rows
+    // are plain head slices (n_embd_head_k rows) and follow the same order.
+    const bool mwe_permute = mwe_attn_layer(tc.il) && split_state.axis >= 0 &&
+        split_state.axis < GGML_MAX_DIMS && (std::regex_match(tensor_name, pattern_q_weight) ||
+        std::regex_match(tensor_name, pattern_attn_out_weight));
+    if (mwe_permute) {
+        const uint32_t n_dev     = ud->n_devices;
+        const uint32_t n_head    = hparams.n_head(tc.il);
+        const uint32_t n_head_kv = hparams.n_head_kv(tc.il);
+        const int64_t  head_rows = std::regex_match(tensor_name, pattern_attn_out_weight)
+            ? (int64_t) hparams.n_embd_head_k(tc.il)
+            : 2 * (int64_t) hparams.n_embd_head_k(tc.il);
+        const int64_t per_slot = (int64_t) (n_head / n_dev / n_head_kv) * head_rows;
+        split_state.n_segments = n_head_kv * n_dev;
+        for (uint32_t g = 0; g < n_head_kv; g++) {
+            for (uint32_t m = 0; m < n_dev; m++) {
+                split_state.ne[(g * n_dev + m) * n_dev + m] = per_slot;
+                split_state.nr[g * n_dev + m] = 1;
+            }
+        }
+    } else if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
     if (llama_ple_shard_enabled(ud->model) && tensor_name == "per_layer_token_embd.weight" &&
             tc.axis == GGML_BACKEND_SPLIT_AXIS_1) {
         if (llama_ple_shard_rows_enabled(ud->model)) {
@@ -924,7 +980,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.n_segments = n_head_ple;
         return split_state;
     }
-    if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
 
