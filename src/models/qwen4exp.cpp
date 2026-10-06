@@ -801,6 +801,17 @@ static bool qwen4exp_qsa_sparse_kernel_enabled() {
     return enabled;
 }
 
+// LLAMA_QSA_Q4V=1 lets the block-sparse kernel also take a Q4_0 V cache (the 262K capacity
+// configs); the kernel dequantizes V in place, mirroring the gather fallback's GET_ROWS
+// arithmetic so both paths see the same values. Default 0 keeps the F16 gather fallback.
+static bool qwen4exp_qsa_q4v_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_Q4V");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // LLAMA_PLE_ONECAT=1 selects the fused SM70 PLE convolution path.  The
 // default keeps the original graph chain for rollback and parity fallback.
 static bool qwen4exp_ple_onecat_enabled() {
@@ -1919,8 +1930,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_blk(
         // decode-sized batches keep the gather + flash attention path (as fast there); prompt batches,
         // which the gather path cannot take, use the sparse kernel
         // (q and the cached K/V are already Hadamard-rotated alike when the cache rotates them)
+        const bool v_sparse = v_all->type == GGML_TYPE_Q8_0 ||
+            (v_all->type == GGML_TYPE_Q4_0 && qwen4exp_qsa_q4v_enabled());
         const bool sparse_ok = qwen4exp_qsa_sparse_kernel_enabled() && n_tok > 16 &&
-            k_all->type == GGML_TYPE_Q8_0 && v_all->type == GGML_TYPE_Q8_0 && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
+            k_all->type == GGML_TYPE_Q8_0 && v_sparse && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
             k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2] && r == 4 && q_cur->type == GGML_TYPE_F32;
         if (sparse_ok) {
             // block-sparse kernel: reads each query's blocks straight from the Q8_0 cache
