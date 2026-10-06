@@ -329,6 +329,8 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    bool mtp_adaptive = false; // choose 2 or 3 MTP drafts using per-request acceptance
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
@@ -450,6 +452,9 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_ft_native_moe = 0; // experimental global native expert slots
+    int32_t n_moe_expert_cache    =     0; // GPU-resident MoE expert slots per tensor (0 = disabled)
+    int32_t n_moe_expert_inserts  =     2; // experts promoted into VRAM per tensor per step
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -926,6 +931,9 @@ bool tty_can_use_colors();
 struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
+// applies LLAMA_MTP_N_UBATCH to the params of an MTP draft context
+void common_mtp_apply_ubatch_override(llama_context_params & cparams);
+
 struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();

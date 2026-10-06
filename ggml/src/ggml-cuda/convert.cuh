@@ -12,6 +12,10 @@ typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
 
+// [SM70_BF16_PREFILL_F16 / strata #540] saturated variant for cuBLAS F16-compute GEMM operands only:
+// finite values beyond F16's range (65504) clamp instead of becoming Inf/NaN in the product.
+to_fp16_cuda_t ggml_get_to_fp16_sat_cuda(ggml_type type);
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
@@ -29,6 +33,7 @@ typedef to_t_nc_cuda_t<nv_bfloat16> to_bf16_nc_cuda_t;
 
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
+to_fp16_nc_cuda_t ggml_get_to_fp16_sat_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
 
 template<typename dst_t, typename src_t>

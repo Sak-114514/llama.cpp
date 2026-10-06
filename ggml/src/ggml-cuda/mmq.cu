@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmq-moe-grouped.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -180,6 +181,14 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 
+    // MoE grouped MMQ (env-gated, default off): a compact single launch over the live
+    // per-expert column tiles instead of the full ncols_max-padded grid. See
+    // mmq-moe-grouped.cuh and patches/moe-grouped-NOTES.md. Returns false (nothing launched)
+    // for unsupported shapes/types so the regular path below takes over transparently.
+    if (ggml_cuda_moe_grouped_enabled() && ggml_cuda_mul_mat_q_moe_grouped(ctx, src0, src1, ids, dst)) {
+        return;
+    }
+
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
@@ -331,6 +340,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // Volta MoE: with many experts each one sees only a few tokens of the batch, so the grouped
+        // MMQ kernel beats the per-expert fallback (host sync plus a small GEMM per expert) at any batch
+        if (n_experts > 0 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
+            return true;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 

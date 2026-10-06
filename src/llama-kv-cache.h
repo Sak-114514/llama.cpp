@@ -429,6 +429,20 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // true when the current ubatch sits in stream 0, in the consecutive cells right after all used ones. With one
+    // sequence written in order, every cell then holds the token of the same rank, even where positions skip or repeat
+    // (an M-RoPE image numbers fewer positions than it has tokens)
+    bool ubatch_cells_follow() const;
+
+    // the cell of the current ubatch's first token
+    uint32_t ubatch_cell0() const;
+
+    // rope sections (t, y, x, t) of the token in cell i of the current ubatch's stream
+    void cell_rope_pos(uint32_t i, int32_t * sec) const;
+
+    // false for full-cache and update contexts, which carry no ubatch
+    bool has_ubatch() const { return i_cur < sinfos.size() && i_cur < ubatches.size(); }
+
 private:
     llama_memory_status status;
 

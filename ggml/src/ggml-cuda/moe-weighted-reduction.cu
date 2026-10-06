@@ -63,3 +63,44 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// the shared-expert tail out = sigmoid(g[t]) * sh + moe with moe = the weighted expert sum, in one kernel. Rounded as
+// elem_chain_f32<op_sigmoid, mul, post> over the result of moe_weighted_reduction_f32.
+static __global__ void moe_tail_f32(const float * __restrict__ experts, const float * __restrict__ expert_scale,
+                                    const float * __restrict__ weights, const float * __restrict__ g,
+                                    const float * __restrict__ sh, float * __restrict__ dst,
+                                    const int64_t n_embd, const int n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_embd) {
+        return;
+    }
+
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    float sum = 0.0f;
+    for (int expert = 0; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        const float scale  = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+        const float xs     = __fmul_rn(experts[row * n_embd + col], scale);
+        sum = expert == 0 ? __fmul_rn(xs, weights[row]) : __fmaf_rn(xs, weights[row], sum);
+    }
+
+    float v = g[token];
+    v = 1.0f / (1.0f + expf(-v));
+    v = __fmul_rn(v, sh[token * n_embd + col]); // elem_chain_f32 multiplies and adds separately (no FFMA)
+    v = __fadd_rn(v, sum);
+    dst[token * n_embd + col] = v;
+}
+
+void ggml_cuda_op_moe_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * expert_scale,
+                           const ggml_tensor * weights, const ggml_tensor * g, const ggml_tensor * sh, ggml_tensor * dst) {
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    constexpr int threads = 256;
+    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+    moe_tail_f32<<<blocks, threads, 0, ctx.stream()>>>((const float *) experts->data,
+        expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data, (const float *) g->data,
+        (const float *) sh->data, (float *) dst->data, n_embd, (int) n_expert_used);
+    CUDA_CHECK(cudaGetLastError());
+}

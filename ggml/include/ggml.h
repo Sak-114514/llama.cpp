@@ -601,6 +601,12 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ALLREDUCE, // in-place sum across devices, created by the meta backend only
+        GGML_OP_ARGMAX_SPLIT,
+        GGML_OP_HC_FUSED,
+        GGML_OP_PLE_CONV_SM70,
+        GGML_OP_MONOMOE_SM70,
+
         GGML_OP_COUNT,
     };
 
@@ -1073,6 +1079,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // argmax along rows of a matrix whose rows may be split across devices (meta backend):
+    //     result [2*n_dev, nrows] F32 holds (max, index) for the slice of each device, pick the best with ggml_argmax.
+    //     Outside the meta backend, slot 0 holds the result and the other slots never win.
+    GGML_API struct ggml_tensor * ggml_argmax_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_dev);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
@@ -2725,6 +2739,54 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Fused hyper-connection mix and combine (Qwen3.8-Flash-Next), for few tokens.
+    //   x [n_embd, hc, T] residual streams, w_norm [n_embd, hc]; xn = rms_norm(x per stream, eps) * w_norm
+    //
+    // mix_down: w_down Q8_0 [n_embd*hc, lr], w_inject F32 [n_embd*hc, hc] or NULL
+    //   -> [lr + 2*hc, T]: rows [0, lr)       silu(w_down . xn / hc)
+    //                      rows [lr, lr+hc)   w_inject . xn (0 without w_inject)
+    //                      rows [lr+hc, lr+2hc) 1/rms of each stream
+    GGML_API struct ggml_tensor * ggml_hc_mix_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_inject,
+            float                 eps);
+
+    // mix_up: w_up Q8_0 [lr, n_embd*hc], down = result of ggml_hc_mix_down
+    //   -> [n_embd, T]: 1/hc * sum_s xn[:, s] * sigmoid((w_up . lo)[:, s])
+    GGML_API struct ggml_tensor * ggml_hc_mix_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * down);
+
+    // combine: block_out [n_embd, T], x [n_embd, hc, T], down = result of ggml_hc_mix_down (inject rows) or inject [hc, T]
+    //   -> [n_embd, hc, T]: x + block_out * 2*sigmoid(inject / hc)
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * down);
+
+    // Fused qwen4exp PLE causal depthwise convolution and recurrent-state tails.
+    // x [C, T, S], state [H, C, S], w [K, C] -> [C, T + n_slots*H, S].
+    // Experimental decode-only routed MoE; up may be NULL for packed gate||up.
+    GGML_API struct ggml_tensor * ggml_monomoe_sm70(
+            struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * router,
+            struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down,
+            int32_t n_selected, float routing_scale);
+
+    GGML_API struct ggml_tensor * ggml_ple_conv_sm70(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * w,
+            int32_t               dil,
+            int32_t               n_slots);
 
     // custom operators
 

@@ -423,6 +423,12 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
 
+    // many short rows (e.g. the few trailing columns of a convolution state) are far slower as a
+    // 2D memcpy than through the copy kernel: on V100, 10240 rows of 12 bytes took ~16 us vs ~3 us
+    if (width < 256) {
+        return false;
+    }
+
     return spitch >= width && dpitch >= width;
 }
 

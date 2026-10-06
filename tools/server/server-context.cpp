@@ -36,6 +36,71 @@
 #include <windows.h>
 #endif
 
+
+// LLAMA_SPEC_TIMING=1: host time per speculative-loop phase, averaged over update_slots calls
+// LLAMA_FULL_STEP_TIMING=1: emit one raw update_slots span for a generating slot.
+static bool full_step_timing_enabled() {
+    static const bool enabled = [] { const char * env = getenv("LLAMA_FULL_STEP_TIMING"); return env != nullptr && atoi(env) != 0; }();
+    return enabled;
+}
+
+struct spec_phase_timing {
+    int64_t t[16] = {0};
+    int64_t n = 0;
+    static bool enabled() {
+        static const bool e = [] { const char * v = getenv("LLAMA_SPEC_TIMING"); return v && atoi(v) != 0; }();
+        return e;
+    }
+    void report() {
+        static const char * names[16] = { "total", "tgt_decode", "spec_process", "accept", "draft", "pre_draft", "render", "rest", "ckpt",
+                                          "a_clone", "a_sample", "a_post", "a_emit", "b_last", "b_prompts", "b_lora_etc" };
+        if (++n % 200 != 0) return;
+        t[7] = t[0];
+        for (int i = 1; i < 9; ++i) { if (i != 7) t[7] -= t[i]; }
+        std::string line;
+        for (int i = 0; i < 16; ++i) { line += string_format(" %s=%.0f", names[i], t[i]/200.0); t[i] = 0; }
+        LOG_INF("spec-timing avg_us:%s\n", line.c_str());
+    }
+};
+static spec_phase_timing g_spec_timing;
+static int64_t g_spec_mark = 0;
+static int64_t g_full_step_prev_end_us = 0;
+static int g_full_step_prev_task_id = -1;
+static int g_full_step_prev_slot = -1;
+// adds the time since mark to phase idx and moves the mark
+static void spec_phase_lap(int idx, int64_t & mark) {
+    if (spec_phase_timing::enabled()) { const int64_t t = ggml_time_us(); g_spec_timing.t[idx] += t - mark; mark = t; }
+}
+struct spec_phase_scope {
+    int idx; int64_t t0;
+    spec_phase_scope(int idx) : idx(idx), t0(spec_phase_timing::enabled() ? ggml_time_us() : 0) {}
+    ~spec_phase_scope() { if (spec_phase_timing::enabled()) g_spec_timing.t[idx] += ggml_time_us() - t0; }
+};
+
+// LLAMA_SPEC_PAD_MULTI=N (N > 0): in multi-slot speculative decoding, pad every pure decode/verify
+// sub-batch to a fixed total of N tokens by appending dummy rows that repeat the last row of the
+// batch at the following positions of its sequence. This keeps both the token count and the output
+// count constant, i.e. the graph built for one verify step is reused by all the others.
+//
+// Isolation semantics (same as the single-slot LLAMA_MTP_PAD in common/speculative.cpp):
+//   - the pad rows sit at positions *above* every real row of their sequence, so the causal mask
+//     keeps them out of every real row's attention: real logits / h_nextn / samples are unchanged;
+//   - their logits and h_nextn outputs land in rows after all real rows and are never read;
+//   - their KV cells are removed with llama_memory_seq_rm() at the END of post_decode(), after the
+//     speculative acceptance has trimmed the same sequence. A tail removal is a single-use,
+//     depth-bounded operation on rollback-capable memories (the recurrent state of hybrid targets,
+//     DSV4 caches): removing the pad cells immediately after the decode made the acceptance trim
+//     fail afterwards and abort the server with "failed to remove sequence ..." - see the cleanup
+//     at the end of post_decode() for the full ordering rules.
+// 0 or unset disables the padding entirely (current behavior).
+static int32_t server_spec_pad_multi() {
+    static const int32_t value = [] {
+        const char * env = getenv("LLAMA_SPEC_PAD_MULTI");
+        return env ? std::max(0, atoi(env)) : 0;
+    }();
+    return value;
+}
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -912,6 +977,27 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // LLAMA_SPEC_PAD_MULTI scratch: the fixed-shape copy of the decode batch is rebuilt here on
+    // every padded decode() call, so no allocation happens in steady state
+    std::vector<llama_token>    spec_pad_token;
+    std::vector<llama_pos>      spec_pad_pos;
+    std::vector<llama_seq_id>   spec_pad_seq_data;
+    std::vector<llama_seq_id *> spec_pad_seq_id;
+    std::vector<int32_t>        spec_pad_n_seq_id;
+    std::vector<int8_t>         spec_pad_logits;
+
+    // set when a padded decode failed and the batch is being retried: retry without padding so
+    // that the retry loop always makes progress; reset on every new update_slots() batch
+    bool spec_pad_retry = false;
+
+    // deferred LLAMA_SPEC_PAD_MULTI cleanup: set by decode() when it submitted a padded batch, read
+    // and reset by post_decode() after the speculative acceptance trims. The pad rows must stay in
+    // the target memory until every slot of the sub-batch has been accepted/rolled back: their
+    // removal is part of the same single tail trim the acceptance path performs on that sequence.
+    // -1 = no pad rows pending removal
+    llama_seq_id spec_pad_rm_seq = -1;  // sequence that received the pad rows
+    llama_pos   spec_pad_rm_pos = -1;   // position of its last real row
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -926,6 +1012,9 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    bool prefill_fair_share = false;
+    bool prefill_fair_share_logged = false;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1011,6 +1100,13 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (!prefill_fair_share_logged) {
+            const char * fair_share_env = getenv("LLAMA_PREFILL_FAIR_SHARE");
+            prefill_fair_share = fair_share_env != nullptr && atoi(fair_share_env) == 1;
+            SRV_INF("prefill fair share: enabled=%s, policy=per-compatible-text-cohort floor(remaining/n) with minimum quota 1\n",
+                    prefill_fair_share ? "true" : "false");
+            prefill_fair_share_logged = true;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1277,6 +1373,20 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        if (spec && server_spec_pad_multi() > 0 && slots.size() > 1) {
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                SRV_WRN("LLAMA_SPEC_PAD_MULTI = %d is not supported by this context (no partial sequence removal) - padding disabled\n",
+                        server_spec_pad_multi());
+            } else if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                SRV_INF("LLAMA_SPEC_PAD_MULTI = %d: multi-slot verify decodes padded to a fixed %d tokens "
+                        "(effective max: n_batch = %d, per-step padding capped by the rollback budget n_rs_seq = %d)\n",
+                        server_spec_pad_multi(), server_spec_pad_multi(), llama_n_batch(ctx_tgt), llama_n_rs_seq(ctx_tgt));
+            } else {
+                SRV_INF("LLAMA_SPEC_PAD_MULTI = %d: multi-slot verify decodes padded to a fixed %d tokens (effective max: n_batch = %d)\n",
+                        server_spec_pad_multi(), server_spec_pad_multi(), llama_n_batch(ctx_tgt));
+            }
         }
 
         if (!spec && params_base.speculative.has_synth()) {
@@ -2791,6 +2901,59 @@ private:
 #endif
 
     void update_slots() {
+        int full_slot = -1;
+        int full_task_id = -1;
+        int32_t full_n_gen_before = 0;
+        if (full_step_timing_enabled()) {
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.stats.n_gen > 0) {
+                    full_slot = slot.id;
+                    full_task_id = slot.task ? slot.task->id : -1;
+                    full_n_gen_before = slot.stats.n_gen;
+                    break;
+                }
+            }
+        }
+
+        const int64_t spec_t0 = spec_phase_timing::enabled() ? ggml_time_us() : 0;
+        struct spec_total_guard {
+            int64_t t0;
+            ~spec_total_guard() { if (spec_phase_timing::enabled()) { g_spec_timing.t[0] += ggml_time_us() - t0; g_spec_timing.report(); } }
+        } spec_total_guard_{spec_t0};
+
+        int32_t full_batch_tokens = 0;
+        struct full_step_guard {
+            bool active; int64_t start_us; int slot; int task_id; int32_t n_gen_before; int32_t & batch_tokens;
+            int64_t spec_before[16];
+
+            full_step_guard(bool active_, int64_t start_us_, int slot_, int task_id_, int32_t n_gen_before_, int32_t & batch_tokens_)
+                    : active(active_), start_us(start_us_), slot(slot_), task_id(task_id_), n_gen_before(n_gen_before_), batch_tokens(batch_tokens_) {
+                if (active) for (int i = 0; i < 16; ++i) {
+                    spec_before[i] = g_spec_timing.t[i];
+                }
+            }
+
+            ~full_step_guard() {
+                if (!active) return;
+
+                const int64_t end_us = ggml_time_us();
+                const int64_t gap_us = g_full_step_prev_end_us != 0 &&
+                        g_full_step_prev_task_id == task_id && g_full_step_prev_slot == slot
+                        ? start_us - g_full_step_prev_end_us : -1;
+                std::string phases;
+                for (int i = 1; i < 16; ++i) {
+                    phases += string_format(" t%d_delta_us=%" PRId64, i, g_spec_timing.t[i] - spec_before[i]);
+                }
+                LOG_INF("full-step start_us=%" PRId64 " end_us=%" PRId64 " span_us=%" PRId64
+                        " task=%d slot=%d n_gen_before=%d batch_tokens=%d gap_us=%" PRId64 "%s\n",
+                        start_us, end_us, end_us - start_us, task_id, slot, n_gen_before, batch_tokens, gap_us, phases.c_str());
+                g_full_step_prev_end_us = end_us;
+                g_full_step_prev_task_id = task_id;
+                g_full_step_prev_slot = slot;
+            }
+        } full_step_guard_{full_slot >= 0, full_slot >= 0 ? ggml_time_us() : 0, full_slot, full_task_id,
+                full_n_gen_before, full_batch_tokens};
+        g_spec_mark = spec_t0;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2833,8 +2996,14 @@ private:
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
+            // a new batch: allow LLAMA_SPEC_PAD_MULTI padding again (the flag is only used to
+            // guarantee progress while a padded decode is being retried with a smaller batch)
+            spec_pad_retry = false;
             pre_decode();
+            spec_phase_lap(14, g_spec_mark);
             batch.render();
+            full_batch_tokens = batch.size();
+            spec_phase_lap(6, g_spec_mark);
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3040,12 +3209,15 @@ private:
             }
         });
 
+        spec_phase_lap(5, g_spec_mark);
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                spec_phase_scope spec_scope_draft(4);
                 common_speculative_draft(spec.get());
             });
         }
+        if (spec_phase_timing::enabled()) { g_spec_mark = ggml_time_us(); }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -3095,10 +3267,12 @@ private:
             }
         });
 
+        spec_phase_lap(8, g_spec_mark);
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        spec_phase_lap(13, g_spec_mark);
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3110,6 +3284,51 @@ private:
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
+
+            std::vector<server_slot *> fair_prompt_cohort;
+            int32_t fair_prompt_quota = 0;
+            if (prefill_fair_share) {
+                server_slot * cohort_anchor = slot_batched;
+                for (server_slot & candidate : slots) {
+                    if (candidate.state != SLOT_STATE_PROCESSING_PROMPT && candidate.state != SLOT_STATE_STARTED) {
+                        continue;
+                    }
+                    if (candidate.task == nullptr || !candidate.can_split()) {
+                        continue;
+                    }
+
+                    const size_t prompt_pos = candidate.state == SLOT_STATE_STARTED ? 0 : candidate.prompt.n_tokens();
+                    if (prompt_pos >= candidate.task->tokens.size() ||
+                            candidate.task->tokens[prompt_pos] == LLAMA_TOKEN_NULL) {
+                        continue; // do not split a multimodal chunk
+                    }
+
+                    if (cohort_anchor && !cohort_anchor->can_batch_with(candidate)) {
+                        continue;
+                    }
+
+                    bool compatible = true;
+                    for (server_slot * member : fair_prompt_cohort) {
+                        if (!member->can_batch_with(candidate)) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if (!compatible) {
+                        continue;
+                    }
+
+                    if (!cohort_anchor) {
+                        cohort_anchor = &candidate;
+                    }
+                    fair_prompt_cohort.push_back(&candidate);
+                }
+
+                if (fair_prompt_cohort.size() > 1) {
+                    const int32_t remaining = std::max<int32_t>(0, n_batch - batch.size());
+                    fair_prompt_quota = std::max<int32_t>(1, remaining / (int32_t) fair_prompt_cohort.size());
+                }
+            }
 
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
@@ -3520,8 +3739,13 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    const bool fair_prompt_slot = fair_prompt_quota > 0 &&
+                        std::find(fair_prompt_cohort.begin(), fair_prompt_cohort.end(), &slot) != fair_prompt_cohort.end();
+                    const auto n_tokens_before_text = batch.size();
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                            (!fair_prompt_slot || batch.size() - n_tokens_before_text < fair_prompt_quota)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3675,15 +3899,159 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // LLAMA_SPEC_PAD_MULTI: pad this decode to a fixed token count (see server_spec_pad_multi()).
+        // Only pure decode/verify sub-batches are padded - prefill (prompt) rows keep their exact shape.
+        // The padded batch is passed to llama_decode() only: common_speculative_process() and the
+        // sampling/accept path keep consuming the original, unpadded batch_view.
+        //
+        // The pad rows are intentionally NOT removed here: decode() only records them in
+        // spec_pad_rm_seq / spec_pad_rm_pos, and post_decode() drops their KV cells after the
+        // speculative acceptance has trimmed the same sequences (see the cleanup at its end).
+        llama_batch batch_dec = batch_view;
+
+        // drop any stale bookkeeping (the post_decode() of the previous sub-batch consumed the
+        // previous pad, and an aborted sub-batch releases every slot, which clears its sequence)
+        spec_pad_rm_seq = -1;
+        spec_pad_rm_pos = -1;
+
+        // note: contexts without partial sequence removal (COMMON_CONTEXT_SEQ_RM_TYPE_FULL, e.g.
+        // hybrid targets without a rollback budget) can never drop the pad cells - never pad those
+        if (!spec_pad_retry && spec && slots.size() > 1 && !batch.has_embd &&
+                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            int32_t n_pad_tgt = server_spec_pad_multi();
+
+            if (n_pad_tgt > 0 && batch_view.n_tokens < n_pad_tgt) {
+                bool is_pure_decode = true;
+
+                for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                    const auto & t = batch.tokens[i];
+
+                    is_pure_decode = is_pure_decode && !t.is_prompt;
+
+                    // backend sampling feeds every output row into a device sampler chain: pad rows
+                    // would advance its state, so batches with such slots are never padded
+                    if (t.id_slot >= 0 && t.id_slot < (int32_t) slots.size() && slots[t.id_slot].task) {
+                        is_pure_decode = is_pure_decode && !slots[t.id_slot].task->params.sampling.backend_sampling;
+                    }
+                }
+
+                if (is_pure_decode) {
+                    // never exceed the physical batch limit of the context
+                    n_pad_tgt = std::min(n_pad_tgt, (int32_t) llama_n_batch(ctx_tgt));
+
+                    // extend the last row's sequence: its positions stay consecutive with the KV
+                    // tail, exactly like the draft-side pad of the single-slot LLAMA_MTP_PAD path
+                    const int32_t     i_last = batch_view.n_tokens - 1;
+                    const llama_seq_id seq    = batch_view.seq_id[i_last][0];
+                    const llama_pos   pos    = batch_view.pos[i_last];
+
+                    // keep the pad rows inside the context window of the padded slot
+                    // (mirrors the "pos + n_pad < n_ctx" check of LLAMA_MTP_PAD)
+                    int32_t n_pad = 0;
+
+                    if (seq >= 0 && seq < (llama_seq_id) slots.size()) {
+                        n_pad = std::min(n_pad_tgt - batch_view.n_tokens, slots[seq].n_ctx - 1 - pos);
+                    }
+
+                    // rollback-budget cap: on memories with bounded partial removal (the recurrent
+                    // state of hybrid targets, DSV4 caches) a tail trim may roll back at most
+                    // n_rs_seq positions per decode cycle. The acceptance trim of this sequence in
+                    // post_decode() has to undo the pad rows AND its rejected draft tokens in one
+                    // go, so reserve room for the full draft depth of the padded sequence (its
+                    // rows in this sub-batch minus the sampled token). When nothing is left over,
+                    // this step simply runs unpadded - the batch shape falls back to the real rows.
+                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                        int32_t n_rows_seq = 0;
+
+                        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                            if (batch_view.seq_id[i][0] == seq) {
+                                n_rows_seq++;
+                            }
+                        }
+
+                        n_pad = std::min(n_pad, (int32_t) llama_n_rs_seq(ctx_tgt) - (n_rows_seq - 1));
+                    }
+
+                    if (n_pad > 0) {
+                        const int32_t n_tokens_pad = batch_view.n_tokens + n_pad;
+
+                        spec_pad_token.resize(n_tokens_pad);
+                        spec_pad_pos.resize(n_tokens_pad);
+                        spec_pad_seq_data.resize(n_tokens_pad);
+                        spec_pad_seq_id.resize(n_tokens_pad);
+                        spec_pad_n_seq_id.assign(n_tokens_pad, 1);
+                        spec_pad_logits.resize(n_tokens_pad);
+
+                        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                            spec_pad_token[i]    = batch_view.token[i];
+                            spec_pad_pos[i]      = batch_view.pos[i];
+                            spec_pad_seq_data[i] = batch_view.seq_id[i][0];
+                            spec_pad_logits[i]   = batch_view.logits[i];
+                        }
+
+                        for (int32_t k = 0; k < n_pad; ++k) {
+                            // repeat the last real row at the next positions of its sequence
+                            spec_pad_token   [batch_view.n_tokens + k] = batch_view.token[i_last];
+                            spec_pad_pos     [batch_view.n_tokens + k] = pos + 1 + k;
+                            spec_pad_seq_data[batch_view.n_tokens + k] = seq;
+                            // request logits like every real verify row: the output count is part
+                            // of the graph topology, so it has to stay constant as well. the
+                            // resulting rows sit after all real rows and are never read
+                            spec_pad_logits  [batch_view.n_tokens + k] = 1;
+                        }
+
+                        for (int32_t i = 0; i < n_tokens_pad; ++i) {
+                            spec_pad_seq_id[i] = &spec_pad_seq_data[i];
+                        }
+
+                        batch_dec.n_tokens = n_tokens_pad;
+                        batch_dec.token    = spec_pad_token.data();
+                        batch_dec.embd     = nullptr;
+                        batch_dec.pos      = spec_pad_pos.data();
+                        batch_dec.n_seq_id = spec_pad_n_seq_id.data();
+                        batch_dec.seq_id   = spec_pad_seq_id.data();
+                        batch_dec.logits   = spec_pad_logits.data();
+
+                        // remember the pad for the deferred cleanup in post_decode()
+                        spec_pad_rm_seq = seq;
+                        spec_pad_rm_pos = pos;
+
+                        SRV_DBG("spec pad multi: off = %d, n_tokens = %d -> %d (pad seq = %d, pos = %d..%d)\n",
+                                off, batch_view.n_tokens, n_tokens_pad, seq, (int) (pos + 1), (int) (pos + n_pad));
+                    }
+                }
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        spec_phase_lap(15, g_spec_mark);
+        spec_phase_scope spec_scope_decode(1);
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            ret = llama_decode(ctx_tgt, batch_dec);
+            // when padding, always sync before returning: the pad KV cells must be fully written
+            // before we free them (the actual free happens at the end of post_decode())
+            if (ret == 0 && (has_output || spec_pad_rm_seq >= 0)) {
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        if (spec_pad_rm_seq >= 0 && ret != 0) {
+            // the padded batch failed (e.g. no free KV cells): drop whatever the failed attempt
+            // tagged for the pad range (a prepare-stage failure restores the memory untouched, so
+            // this is usually a no-op) and make sure the retry runs without padding, so that it
+            // cannot fail for the same reason
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_pad_rm_seq, spec_pad_rm_pos + 1, -1);
+
+            spec_pad_rm_seq = -1;
+            spec_pad_rm_pos = -1;
+            spec_pad_retry  = true;
+
+            SRV_WRN("spec pad multi: padded decode failed (ret = %d), retrying without padding\n", ret);
+        }
+
+        // note: on success the pad cells stay in memory until the end of post_decode()
 
         if (ret != 0) {
             {
@@ -3744,6 +4112,7 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                spec_phase_scope spec_scope_process(2);
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
@@ -3908,7 +4277,10 @@ private:
 
             // verify and try to accept the draft
             {
+                spec_phase_scope spec_scope_accept(3);
+                int64_t acc_mark = spec_phase_timing::enabled() ? ggml_time_us() : 0;
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                spec_phase_lap(9, acc_mark);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
@@ -3918,6 +4290,7 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 slot.spec_i_batch.clear();
+                spec_phase_lap(10, acc_mark);
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -3933,6 +4306,9 @@ private:
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
+
+                        // Record the original result; replay must not credit the replacement token.
+                        common_speculative_accept_feedback(spec.get(), slot.id, accepted.size() - 1);
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
@@ -3966,6 +4342,7 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            int64_t post_mark = spec_phase_timing::enabled() ? ggml_time_us() : 0;
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
@@ -3996,6 +4373,7 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            spec_phase_lap(11, post_mark);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4018,9 +4396,42 @@ private:
             }
 
             slot.print_timings_tg();
+            spec_phase_lap(12, post_mark);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        // LLAMA_SPEC_PAD_MULTI: remove the pad rows of the decode() call that produced this
+        // sub-batch. This is the first point where that is safe:
+        //  - the acceptance paths above trim every speculating sequence at its accepted position
+        //    with slot.mem.seq_rm(), which already removes the pad cells that sit above the real
+        //    rows. On rollback-capable memories (hybrid recurrent state, DSV4) such a tail trim is
+        //    single-use per decode cycle and bounded by n_rs_seq: trimming the pad range inside
+        //    decode() as well made the acceptance trim fail afterwards and abort the server with
+        //    "failed to remove sequence %d with p0=..., p1=-1" (decode() reserves the rollback
+        //    budget for the pad rows, see the cap there).
+        //  - everything that ran in between (draft catch-up via common_speculative_process(),
+        //    logits/embedding reads, sampling) only consumes the unpadded batch_view rows and the
+        //    output buffers - the pad cells are never observed. The pad writes were synchronized
+        //    right after the decode.
+        //  - everything that comes afterwards needs them gone: the next decode() of this sequence
+        //    checks position continuity against the memory tail, and the next update_slots()
+        //    iteration queries seq_pos_min/max for the speculative checkpoint bookkeeping.
+        // This is a no-op whenever the acceptance above already removed the range (speculating
+        // padded slot); it does the actual removal for the remaining cases (non-speculating padded
+        // slot, checkpoint-restore path, slot released early).
+        if (spec_pad_rm_seq >= 0) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), spec_pad_rm_seq, spec_pad_rm_pos + 1, -1)) {
+                // not reachable for the context types that pass the gate in decode(): after the
+                // trims above nothing is left in this range. Warn instead of aborting - a leftover
+                // would surface as a decode position error on the next step
+                SRV_WRN("spec pad multi: failed to remove pad cells of sequence %d from pos %d\n",
+                        spec_pad_rm_seq, (int) (spec_pad_rm_pos + 1));
+            }
+
+            spec_pad_rm_seq = -1;
+            spec_pad_rm_pos = -1;
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

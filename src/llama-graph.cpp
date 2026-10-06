@@ -1,5 +1,9 @@
 #include "llama-graph.h"
 
+#include <typeinfo>
+#include "llama-moe-cache.h"
+#include "llama-ft-moe.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -18,6 +22,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -95,7 +100,9 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        if (!(keep_tokens && keep_h && *keep_h)) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -107,7 +114,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (ubatch->embd && !(keep_h && *keep_h)) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -1090,7 +1097,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // qwen4exp's block-sparse decode path attends without the dense mask; skip the O(n_kv) fill
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1102,7 +1112,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // An attention-only MTP graph does not allocate recurrent inputs.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1125,13 +1136,15 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    if (uses_recr) {
+        res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+        res &= inp_rs->head == mctx->get_recr()->get_head();
+        res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    }
 
     return res;
 }
@@ -1320,9 +1333,12 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
+    mtp_feedback = false;
+    mtp_token_feedback = false;
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_argmax      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1422,7 +1438,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         const bool cur = input->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", typeid(*input).name(), cur);
         }
 
         res = res && cur;
@@ -1485,6 +1501,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    ft_moe           (params.ft_moe),
+    moe_cache        (params.moe_cache),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -1492,6 +1510,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    mtp_h_input      (params.mtp_h_input),
+    mtp_h_keep       (params.mtp_h_keep),
+    mtp_token_input  (params.mtp_token_input),
+    mtp_embedding    (params.mtp_embedding),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1515,7 +1537,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = ft_moe && loras->empty() && !cparams.warmup ? ft_moe->build_dense(ctx0,w,cur) : nullptr;
+    if (!res) { res = ggml_mul_mat(ctx0, w, cur); }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1542,12 +1565,95 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// Split one expert matmul across the GPU-resident expert cache and the host copy.
+//
+//   hits   -> mul_mat_id over the VRAM slot buffer, ids remapped expert->slot on the device
+//   misses -> mul_mat_id over the original tensor, ids of resident experts replaced by a
+//             sentinel so the CPU kernel skips them and leaves those rows zero
+//
+// Summing the two reproduces the uncached result: every route is computed exactly once, and
+// the other chain contributes a zero row for it. Returns nullptr when the tensor is not
+// cached, so the caller falls back to the ordinary single matmul.
+ggml_tensor * llm_graph_context::build_moe_cached_mm_id(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * ids) const {
+    if (moe_cache == nullptr) {
+        return nullptr;
+    }
+
+    llama_moe_cache_tensor * ct = moe_cache->find(w);
+    if (ct == nullptr || ct->slots == nullptr || ct->map == nullptr || ct->map_src == nullptr) {
+        return nullptr;
+    }
+
+    const int64_t n_expert  = ct->n_expert;
+    const int64_t n_used    = ids->ne[0];
+    const int64_t n_tokens  = ids->ne[1];
+
+    // --- hit chain: expert -> slot, with uncached routes sent to a per-POSITION dummy slot.
+    //
+    // map holds the slot as a float, or -1 when the expert is not resident. Turning that into
+    // an id has to be position-aware: sending every uncached route of a token to the same slot
+    // would produce duplicate ids, which both the CPU and CUDA batched kernels mis-handle.
+    //
+    //   slot = relu(map)            // the slot, or 0 when absent
+    //        + relu(-map) * pos     // + (n_slots + position) exactly when absent
+    ggml_tensor * m = ggml_reshape_3d(ctx0, ct->map, 1, n_expert, 1);
+    m = ggml_repeat_4d(ctx0, m, 1, n_expert, n_tokens, 1);
+    m = ggml_get_rows(ctx0, m, ids);                                   // [1, n_used, n_tokens] f32
+
+    ggml_tensor * absent = ggml_relu(ctx0, ggml_neg(ctx0, m));         // 1 where absent, else 0
+    ggml_tensor * slot_f = ggml_add(ctx0, ggml_relu(ctx0, m),
+                                    ggml_mul(ctx0, absent, moe_cache->dummy_pos));
+    ggml_tensor * ids_hit = ggml_reshape_2d(ctx0, ggml_cast(ctx0, slot_f, GGML_TYPE_I32),
+                                            n_used, n_tokens);
+
+    // --- miss chain: expert -> itself, or an out-of-range sentinel once it is resident, which
+    // the CPU kernel skips while zeroing those rows. Duplicated sentinels are harmless there.
+    ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
+
+    // Harvest routing from the contiguous copy, never from `ids` itself: that one is a strided
+    // view of the top-k result, so its ggml_nbytes covers the parent's extent and reading it
+    // into an element-sized buffer overruns the heap.
+    moe_cache->note_ids(ct, ids_flat);
+    ggml_tensor * ids_miss = ggml_reshape_2d(ctx0,
+                                    ggml_get_rows(ctx0, ct->map_src, ids_flat), n_used, n_tokens);
+
+    ggml_tensor * hit  = ggml_mul_mat_id(ctx0, ct->slots, cur, ids_hit);
+    ggml_tensor * miss = ggml_mul_mat_id(ctx0, w,         cur, ids_miss);
+
+    // The miss chain must run on the CPU, where the weights already live and where the
+    // out-of-range sentinel is understood (the CUDA kernels have no skip path and would read
+    // past the expert count). Without this the scheduler is free to move it once its ids come
+    // from a device tensor, which silently changes both the numerics and the semantics.
+    static const bool pin_miss = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_PIN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (pin_miss) {
+        ggml_backend_sched_set_tensor_backend(sched, miss, backend_cpu);
+    }
+
+    if (moe_chain == 1) {
+        return hit;
+    }
+    if (moe_chain == 2) {
+        return miss;
+    }
+
+    return ggml_add(ctx0, hit, miss);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res = build_moe_cached_mm_id(w, cur, ids);
+    if (res == nullptr) {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2015,6 +2121,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in) const {
+    // Expert-cache split. Each route is served entirely by one side, and a route the other
+    // side does not own yields zeros, which survive the activation (silu(0)*0 = 0) and the
+    // down projection -- so running the whole FFN twice and adding is exactly the uncached
+    // result. Emitting whole FFNs (rather than splitting each mul_mat_id) keeps the GPU and
+    // CPU nodes in two contiguous runs.
+    if (moe_chain == 0 && moe_cache != nullptr &&
+        (moe_cache->find(up_exps) || moe_cache->find(gate_up_exps))) {
+        moe_chain = 1;
+        ggml_tensor * out_hit  = build_moe_ffn(cur, gate_inp, gate_inp_b, up_exps, up_exps_b,
+                gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b, n_expert,
+                n_expert_used, type_op, norm_w, w_scale, gating_op, il, probs_in, gate_up_exps,
+                gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, selected_experts_in);
+
+        moe_chain = 2;
+        ggml_tensor * out_miss = build_moe_ffn(cur, gate_inp, gate_inp_b, up_exps, up_exps_b,
+                gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b, n_expert,
+                n_expert_used, type_op, norm_w, w_scale, gating_op, il, probs_in, gate_up_exps,
+                gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, selected_experts_in);
+
+        moe_chain = 0;
+        return ggml_add(ctx0, out_hit, out_miss);
+    }
+
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2149,6 +2278,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (ft_moe && n_tokens <= 4 && !cparams.warmup && loras->empty() && type_op == LLM_FFN_SILU &&
+        !gate_inp_b && !up_exps_b && !gate_exps_b && !down_exps_b && !weight_before_ffn &&
+        il >= 0 && hparams.swiglu_clamp_exp[il] == 0.0f) {
+        if (auto * native = ft_moe->build(ctx0, il, cur, selected_experts, weights)) {
+            static const bool route_fusion = [] {
+                const char * value = std::getenv("GGML_FT_ROUTE_FUSION");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            if (route_fusion) {
+                // Keep routing nodes adjacent, as in the standard expert path below.
+                ggml_build_forward_expand(gf, weights);
+            }
+            cb(native, "ffn_ft_native", il);
+            return native;
+        }
     }
 
     //call early so that topk-moe can be used
@@ -3772,6 +3918,48 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+bool llama_gpu_argmax_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_GPU_ARGMAX");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+void llm_graph_context::build_argmax() const {
+    if (!cparams.gpu_argmax || !samplers.empty() || !res->t_logits ||
+            res->t_logits->type != GGML_TYPE_F32 || !ggml_is_matrix(res->t_logits)) {
+        return;
+    }
+    ggml_tensor * am = nullptr;
+    if (cparams.argmax_n_dev > 1) {
+        // tensor split: the logits are split by vocab. Each device finds its best (value, index) in its slot,
+        //     the slots are summed across devices, then the best slot wins (ties: lower slot = lower token id)
+        const int64_t n_dev  = cparams.argmax_n_dev;
+        const int64_t n_rows = res->t_logits->ne[1];
+        ggml_tensor * cand = ggml_reshape_3d(ctx0, ggml_argmax_split(ctx0, res->t_logits, n_dev), 2, n_dev, n_rows);
+        ggml_tensor * vals = ggml_cont(ctx0, ggml_view_3d(ctx0, cand, 1, n_dev, n_rows, cand->nb[1], cand->nb[2], 0));
+        ggml_tensor * ids  = ggml_cont(ctx0, ggml_view_3d(ctx0, cand, 1, n_dev, n_rows, cand->nb[1], cand->nb[2], cand->nb[0]));
+        ggml_tensor * slot = ggml_argmax(ctx0, ggml_reshape_2d(ctx0, vals, n_dev, n_rows));
+        ggml_tensor * best = ggml_get_rows(ctx0, ids, ggml_reshape_2d(ctx0, slot, 1, n_rows));
+        am = ggml_cast(ctx0, ggml_reshape_1d(ctx0, best, n_rows), GGML_TYPE_I32);
+    } else {
+        am = ggml_argmax(ctx0, res->t_logits);
+    }
+    ggml_set_name(am, "result_argmax");
+    ggml_set_output(am);
+    ggml_build_forward_expand(gf, am);
+    res->t_argmax = am;
+    if (mtp_token_input) {
+        GGML_ASSERT(res->mtp_feedback && ggml_nelements(am) == 1);
+        auto * repeated = ggml_repeat(ctx0, ggml_cast(ctx0, am, GGML_TYPE_F32), mtp_token_input);
+        auto * feedback = ggml_cpy(ctx0, ggml_cast(ctx0, repeated, GGML_TYPE_I32), mtp_token_input);
+        ggml_set_name(feedback, "mtp_gpu_token_feedback");
+        ggml_build_forward_expand(gf, feedback);
+        res->mtp_token_feedback = true;
+    }
 }
 
 void llm_graph_context::build_sampling() const {

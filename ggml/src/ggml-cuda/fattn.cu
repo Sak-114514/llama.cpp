@@ -4,6 +4,14 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "fattn-q8-volta-head.cuh"
+#include "fattn-volta-onecat.cuh"
+#endif
+#include "qsa-attn.cuh"
+
+#include <cstdlib>
+#include <cstring>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -519,6 +527,10 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    BEST_FATTN_KERNEL_VOLTA_Q8_HEAD = 500,
+    BEST_FATTN_KERNEL_ONECAT_XQA    = 600,
+#endif
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -670,6 +682,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * q8_head_env = std::getenv("GGML_CUDA_VOLTA_Q8_HEAD_TC");
+    const bool q8_head_enabled = q8_head_env != nullptr && std::strcmp(q8_head_env, "1") == 0;
+    if (cc == GGML_CUDA_CC_VOLTA && q8_head_enabled && ggml_q8v_head::get_variant(dst) != ggml_q8v_head::variant::none) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("%s: using opt-in Volta dense Q8 head path (QH=%lld KVH=%lld T=%lld)\n",
+                    __func__, (long long) Q->ne[2], (long long) K->ne[2], (long long) Q->ne[1]);
+            logged = true;
+        }
+        return BEST_FATTN_KERNEL_VOLTA_Q8_HEAD;
+    }
+
+    // Opt-in Onecat Flash-V100 decode port (1Cat-vLLM SM70 kernels).
+    if (cc == GGML_CUDA_CC_VOLTA && ggml_onecat_v100::env_enabled() && ggml_onecat_v100::supported(dst)) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("%s: using opt-in Onecat Flash-V100 XQA decode path (QH=%lld KVH=%lld T=%lld S=%lld n_kv=%lld)\n",
+                    __func__, (long long) Q->ne[2], (long long) K->ne[2], (long long) Q->ne[1],
+                    (long long) Q->ne[3], (long long) K->ne[1]);
+            logged = true;
+        }
+        return BEST_FATTN_KERNEL_ONECAT_XQA;
+    }
+#endif
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -718,6 +756,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (ggml_cuda_qsa_attn_is_sparse(dst)) {
+        return ggml_nbytes(dst);
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -727,6 +768,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(V != nullptr);
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (kernel == BEST_FATTN_KERNEL_VOLTA_Q8_HEAD) {
+        return ggml_q8v_head::get_alloc_size(dst);
+    }
+    if (kernel == BEST_FATTN_KERNEL_ONECAT_XQA) {
+        return ggml_onecat_v100::get_alloc_size(dst);
+    }
+#endif
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -742,6 +792,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case BEST_FATTN_KERNEL_VOLTA_Q8_HEAD:
+            GGML_ABORT("unreachable");
+            break;
+#endif
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -754,6 +809,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_qsa_attn_is_sparse(dst)) {
+        ggml_cuda_qsa_attn(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -766,9 +825,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case BEST_FATTN_KERNEL_VOLTA_Q8_HEAD:
+            ggml_q8v_head::launch(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_ONECAT_XQA:
+            ggml_onecat_v100::launch(ctx, dst);
+            break;
+#endif
     }
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_qsa_attn_is_sparse(dst)) {
+        return ggml_cuda_qsa_attn_supported(dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

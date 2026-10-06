@@ -159,6 +159,16 @@ struct clip_ctx {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
 
+    // MTMD_ON_DEMAND=1 with a GPU backend: the weights stay in pinned host memory and every encode borrows device
+    // memory from the model's weights (GGML_CUDA_EVICT_MIB): evict, copy the weights in, encode, free every device
+    // allocation of this context, restore. See clip_on_demand_begin/end.
+    bool on_demand = false;
+    ggml_backend_dev_t dev_od = nullptr;
+    size_t (*evict_weights)(ggml_backend_dev_t)   = nullptr;
+    bool   (*restore_weights)(ggml_backend_dev_t) = nullptr;
+    ggml_backend_buffer_ptr buf_od;                          // device copy of the weights during an encode
+    std::vector<std::pair<ggml_tensor *, void *>> host_data; // host address of each weight meanwhile
+
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
@@ -217,21 +227,44 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
-        sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
-        );
-
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+        const char * od = getenv("MTMD_ON_DEMAND");
+        if (backend != backend_cpu && od != nullptr && atoi(od) != 0) {
+            on_demand = true;
+            dev_od = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev_od);
+            evict_weights   = (size_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_evict_weights");
+            restore_weights = (bool   (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_restore_weights");
+            LOG_INF("%s: CLIP on demand on %s%s\n", __func__, ggml_backend_dev_name(dev_od),
+                evict_weights ? ", borrowing memory from evictable model weights" : "");
         }
+
+        cb_eval           = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
+
+        make_sched();
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
-        ggml_backend_free(backend);
+        sched.reset();
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
+        }
+    }
+
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
+
+    void make_sched() {
+        sched.reset(
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+        );
+        if (cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
         }
     }
 
@@ -239,6 +272,80 @@ struct clip_ctx {
     projector_type proj_type() const {
         return model.proj_type;
     }
+};
+
+// on demand: take the device memory for one encode (or the warmup) and give all of it back afterwards
+static void clip_on_demand_begin(clip_ctx & ctx) {
+    if (!ctx.on_demand) {
+        return;
+    }
+    if (ctx.evict_weights != nullptr) {
+        const int64_t t0 = ggml_time_us();
+        const size_t freed = ctx.evict_weights(ctx.dev_od);
+        LOG_DBG("%s: borrowed %.2f MiB of model weights in %.1f ms\n", __func__, freed/1024.0/1024.0, (ggml_time_us() - t0)/1000.0);
+    }
+    if (ctx.backend == nullptr) {
+        ctx.backend = ggml_backend_dev_init(ctx.dev_od, nullptr);
+        GGML_ASSERT(ctx.backend != nullptr);
+        ctx.backend_ptrs[0] = ctx.backend;
+        ctx.make_sched();
+    }
+
+    // device copy of the weights, laid out for the device buffer type
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ctx.dev_od);
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx.ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx.ctx_data.get(), t)) {
+        size = GGML_PAD(size, align) + ggml_backend_buft_get_alloc_size(buft, t);
+    }
+    ctx.buf_od.reset(ggml_backend_buft_alloc_buffer(buft, size));
+    if (!ctx.buf_od) {
+        GGML_ABORT("%s: cannot allocate %.2f MiB for the vision weights on %s; raise GGML_CUDA_EVICT_MIB\n",
+            __func__, size/1024.0/1024.0, ggml_backend_dev_name(ctx.dev_od));
+    }
+    ggml_backend_buffer_set_usage(ctx.buf_od.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *) ggml_backend_buffer_get_base(ctx.buf_od.get());
+    size_t offs = 0;
+    ctx.host_data.clear();
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx.ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx.ctx_data.get(), t)) {
+        offs = GGML_PAD(offs, align);
+        ctx.host_data.emplace_back(t, t->data);
+        void * host = t->data;
+        t->data   = base + offs;
+        t->buffer = ctx.buf_od.get();
+        GGML_ASSERT(ggml_backend_buffer_init_tensor(ctx.buf_od.get(), t) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_set(t, host, 0, ggml_nbytes(t));
+        offs += ggml_backend_buft_get_alloc_size(buft, t);
+    }
+}
+
+static void clip_on_demand_end(clip_ctx & ctx) {
+    if (!ctx.on_demand) {
+        return;
+    }
+    for (auto & [t, host] : ctx.host_data) {
+        t->data   = host;
+        t->buffer = ctx.buf.get();
+    }
+    ctx.host_data.clear();
+    ctx.buf_od.reset();
+
+    // the compute buffers go with the scheduler, the memory pools and cuBLAS workspaces with the backend
+    ctx.sched.reset();
+    ggml_backend_free(ctx.backend);
+    ctx.backend         = nullptr;
+    ctx.backend_ptrs[0] = nullptr;
+
+    if (ctx.restore_weights != nullptr && !ctx.restore_weights(ctx.dev_od)) {
+        GGML_ABORT("%s: the model weights could not be restored", __func__);
+    }
+}
+
+struct clip_on_demand_scope {
+    clip_ctx & ctx;
+    explicit clip_on_demand_scope(clip_ctx & ctx) : ctx(ctx) { clip_on_demand_begin(ctx); }
+    ~clip_on_demand_scope() { clip_on_demand_end(ctx); }
 };
 
 //
@@ -3609,6 +3716,12 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            if (ctx_clip.on_demand) {
+                // on demand: the weights live in pinned (or plain) host memory and are copied to the device for each encode
+                ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ctx_clip.dev_od);
+                buft = host_buft ? host_buft : ggml_backend_cpu_buffer_type();
+                LOG_INF("%s: on-demand weights in %s\n", __func__, ggml_backend_buft_name(buft));
+            }
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
@@ -3983,6 +4096,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
             if (ctx_params.warmup) {
+                clip_on_demand_scope on_demand(*ctx_vision);
                 loader.warmup(*ctx_vision);
             }
 
@@ -3997,6 +4111,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
             if (ctx_params.warmup) {
+                clip_on_demand_scope on_demand(*ctx_audio);
                 loader.warmup(*ctx_audio);
             }
         }
@@ -4433,6 +4548,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
     }
+
+    clip_on_demand_scope on_demand(*ctx);
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {

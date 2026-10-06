@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -154,6 +155,186 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// LLAMA_ISLAND_SPLIT groups the tensor-parallel devices into multiple "islands", one meta device
+// per island, e.g. LLAMA_ISLAND_SPLIT=3,3 on six GPUs. Each island runs tensor parallelism over
+// its own devices only (so every AllReduce stays inside one NVLink domain), while the layers are
+// split across the meta devices the same way LLAMA_SPLIT_MODE_LAYER splits them over plain GPUs
+// (one activation copy per island boundary instead of two cross-island AllReduces per layer).
+// With the variable unset a single island spans all devices, which is the previous behavior.
+//
+// The split-state callback is shared by all islands, so the islands must have equal sizes and the
+// first n_island entries of --tensor-split should be uniform. The layer boundary between the
+// islands follows the --tensor-split ratios of the meta devices (all-ones gives the first island
+// one extra repeating block, e.g. 25/23+output on 48+1 blocks); LLAMA_ISLAND_LAYERS in
+// llama-model.cpp can pin it explicitly.
+// LLAMA_DRAFT_DETP=1: run the MTP draft head on a single device without tensor parallelism
+// (see patches/draft-detp-NOTES.md). The plain tensor_split entry of the draft card is scaled
+// by LLAMA_DRAFT_DETP_TRUNK_W so the card also holds the full draft weights + LM-head replica.
+static bool llama_draft_detp_requested() {
+    static const bool requested = [] {
+        const char * s = getenv("LLAMA_DRAFT_DETP");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return requested;
+}
+
+static bool llama_island_split_sizes(size_t n_devs, std::vector<size_t> & island_sizes) {
+    const char * s = getenv("LLAMA_ISLAND_SPLIT");
+    if (s == nullptr || *s == '\0') {
+        island_sizes.assign(1, n_devs);
+        return true;
+    }
+
+    size_t total = 0;
+    const char * begin = s;
+    while (true) {
+        size_t size = 0;
+        bool any = false;
+        while (*begin >= '0' && *begin <= '9') {
+            size = size * 10 + size_t(*begin - '0');
+            any = true;
+            begin++;
+        }
+        if (!any || (*begin != '\0' && *begin != ',')) {
+            LLAMA_LOG_ERROR("%s: invalid LLAMA_ISLAND_SPLIT near '%s'\n", __func__, begin);
+            return false;
+        }
+        island_sizes.push_back(size);
+        total += size;
+        if (*begin == '\0') {
+            break;
+        }
+        begin++; // skip ','
+    }
+
+    if (total != n_devs) {
+        LLAMA_LOG_ERROR("%s: LLAMA_ISLAND_SPLIT sizes sum to %zu, but %zu devices were given\n",
+                __func__, total, n_devs);
+        return false;
+    }
+
+    // the shared split-state callback shards tensors identically on every island
+    for (size_t k = 1; k < island_sizes.size(); k++) {
+        if (island_sizes[k] != island_sizes[0]) {
+            LLAMA_LOG_ERROR("%s: LLAMA_ISLAND_SPLIT requires equal island sizes\n", __func__);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// PLE uses its own row partition; trunk shard ratios do not apply to this device.
+ggml_backend_meta_split_state llama_ple_device_split(const ggml_tensor * tensor, void * userdata) {
+    auto * model = static_cast<llama_model *>(userdata);
+    if (strcmp(tensor->name, "per_layer_token_embd.weight") != 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+    const size_t members = ggml_backend_meta_device_n_devices(model->ple_device);
+    GGML_ASSERT(members > 0 && members <= GGML_BACKEND_META_MAX_DEVICES);
+    ggml_backend_meta_split_state state{};
+    state.axis = GGML_BACKEND_SPLIT_AXIS_1;
+    state.n_segments = 1;
+    state.nr[0] = 1;
+    int64_t low = 0;
+    for (size_t j = 0; j < members; ++j) {
+        const int64_t high = tensor->ne[1] * (int64_t) (j + 1) / members;
+        state.ne[j] = high - low;
+        low = high;
+    }
+    return state;
+}
+
+// create one meta device per island and add them to model->devices
+static bool llama_push_island_meta_devices(llama_model * model, ggml_backend_dev_t * devs, size_t n_devs) {
+    std::vector<size_t> island_sizes;
+    if (!llama_island_split_sizes(n_devs, island_sizes)) {
+        return false;
+    }
+
+    // LLAMA_DRAFT_DETP and LLAMA_ISLAND_SPLIT both reinterpret the tensor_split entries: the
+    // islands split the entry sequence into per-island blocks (and require uniform entries),
+    // while de-TP scales one physical device's entry. They are mutually exclusive - de-TP wins
+    // and the meta device spans all GPUs as one island, like an unset LLAMA_ISLAND_SPLIT.
+    if (llama_draft_detp_requested() && island_sizes.size() > 1) {
+        LLAMA_LOG_WARN("%s: LLAMA_ISLAND_SPLIT is ignored because LLAMA_DRAFT_DETP is enabled "
+                "(the trunk AllReduces span all devices, as without islands)\n", __func__);
+        island_sizes.assign(1, n_devs);
+    }
+
+    model->get_split_state_ud.n_devices = island_sizes[0];
+    model->get_split_state_ud.model     = model;
+
+    // LLAMA_DRAFT_DETP: remember a plain (non-meta) device as the candidate host for the de-TP
+    // MTP draft layers. Recorded here because the plain device list is only available while the
+    // meta devices are being created; unused unless the draft de-TP patch activates at load time.
+    {
+        size_t dev_idx = 0;
+        if (const char * idx_env = getenv("LLAMA_DRAFT_DETP_DEV")) {
+            const long v = atol(idx_env);
+            if (v >= 0 && (size_t) v < n_devs) {
+                dev_idx = (size_t) v;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring LLAMA_DRAFT_DETP_DEV=%s (must be in [0, %zu))\n", __func__, idx_env, n_devs);
+            }
+        }
+        model->draft_detp_dev_candidate = devs[dev_idx];
+
+        // asymmetric tensor split: the draft card's trunk shard is scaled down so the full
+        // draft weights + LM-head replica fit next to it (the load-time memory check in
+        // llama-model.cpp must use the same weight, and falls back to a plain TP draft
+        // without the draft set if even the asymmetric layout does not fit)
+        float trunk_w = 1.0f;
+        if (llama_draft_detp_requested()) {
+            trunk_w = 0.5f;
+            if (const char * w_env = getenv("LLAMA_DRAFT_DETP_TRUNK_W")) {
+                const float v = atof(w_env);
+                if (v > 0.0f && v <= 1.0f) {
+                    trunk_w = v;
+                } else {
+                    LLAMA_LOG_WARN("%s: ignoring LLAMA_DRAFT_DETP_TRUNK_W=%s (must be in (0, 1])\n", __func__, w_env);
+                }
+            }
+        }
+        model->get_split_state_ud.detp_trunk_w = trunk_w;
+        model->get_split_state_ud.detp_dev     = dev_idx;
+
+        model->draft_detp_devs.assign(devs, devs + n_devs);
+
+        if (trunk_w != 1.0f) {
+            LLAMA_LOG_INFO("%s: LLAMA_DRAFT_DETP asymmetric tensor split: device %zu (%s) trunk weight %.3f, others 1.000\n",
+                    __func__, dev_idx, ggml_backend_dev_name(devs[dev_idx]), trunk_w);
+        }
+    }
+
+    if (const char * ple = getenv("LLAMA_PLE_SEPARATE")) {
+        if (atoi(ple) != 0) {
+            if (island_sizes.size() != 2 || n_devs != 6) {
+                LLAMA_LOG_ERROR("%s: separate PLE requires two 3-GPU islands\n", __func__);
+                return false;
+            }
+            model->ple_device = ggml_backend_meta_device(devs, n_devs, llama_ple_device_split, model);
+            LLAMA_LOG_INFO("%s: separate PLE device with %zu row shards\n", __func__, n_devs);
+        }
+    }
+
+    size_t begin = 0;
+    for (size_t k = 0; k < island_sizes.size(); k++) {
+        LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices (island %zu):\n",
+                __func__, island_sizes[k], k);
+        for (size_t i = 0; i < island_sizes[k]; i++) {
+            LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(devs[begin + i]));
+        }
+        model->devices.push_back({
+            true, ggml_backend_meta_device(
+            devs + begin, island_sizes[k], llama_meta_device_get_split_state, &model->get_split_state_ud)
+        });
+        begin += island_sizes[k];
+    }
+
+    return true;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -167,16 +348,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (!llama_push_island_meta_devices(model, params.devices, n_devs)) {
+                return false;
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -206,18 +380,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
 
-            LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
-            for (size_t i = 0; i < devs.size(); ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
+            if (!llama_push_island_meta_devices(model, devs.data(), devs.size())) {
+                return false;
             }
-
-            GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
