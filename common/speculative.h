@@ -82,6 +82,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// Record adaptive feedback before checkpoint replay, without committing hidden state.
+// Repeated feedback for the same draft is ignored.
+void common_speculative_accept_feedback(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
@@ -113,3 +117,14 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+// Per-request MTP depth controller. Capacity remains fixed at the configured maximum.
+struct common_speculative_mtp_adaptive {
+    double ema = -1.0;
+    int32_t depth = 2;
+    int32_t pending = 0;
+
+    void reset();
+    int32_t limit(int32_t configured, int32_t remaining) const;
+    void accept(int32_t accepted);
+};

@@ -95,6 +95,16 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Single-sequence Qwen MTP feedback; accepted target state remains separate.
+LLAMA_API bool llama_configure_mtp_gpu_carry(struct llama_context * ctx, int32_t rows);
+LLAMA_API void llama_reuse_mtp_gpu_carry(struct llama_context * ctx, bool value);
+LLAMA_API bool llama_mtp_gpu_carry_ready(const struct llama_context * ctx);
+LLAMA_API bool llama_configure_mtp_gpu_chain(struct llama_context * ctx);
+LLAMA_API void llama_begin_mtp_gpu_chain(struct llama_context * ctx);
+LLAMA_API void llama_abort_mtp_gpu_chain(struct llama_context * ctx);
+LLAMA_API int32_t llama_end_mtp_gpu_chain(struct llama_context * ctx, llama_token * tokens, int32_t capacity);
+LLAMA_API llama_token llama_inspect_mtp_gpu_chain_step(struct llama_context * ctx, int32_t step, bool audit);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

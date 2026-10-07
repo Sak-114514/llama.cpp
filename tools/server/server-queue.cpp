@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
+#include <cstdlib>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -16,6 +18,11 @@
 #define RES_WRN(fmt, ...) LOG_WRN("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_ERR(fmt, ...) LOG_ERR("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_DBG(fmt, ...) LOG_DBG("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+
+static bool full_step_timing_enabled() {
+    static const bool enabled = [] { const char * env = getenv("LLAMA_FULL_STEP_TIMING"); return env != nullptr && atoi(env) != 0; }();
+    return enabled;
+}
 
 //
 // server_queue
@@ -223,6 +230,8 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
 
     QUE_DBG("%s", "yielding to queue\n");
+    const bool full_timing = full_step_timing_enabled();
+    const int64_t work_start_us = full_timing ? ggml_time_us() : 0;
 
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -239,7 +248,9 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     } catch (...) {
         exception = std::current_exception();
     }
+    const int64_t work_end_us = full_timing ? ggml_time_us() : 0;
 
+    const int64_t cv_wait_start_us = full_timing ? ggml_time_us() : 0;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
 
@@ -249,6 +260,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         condition_tasks.wait(lock, [&]{
             return !worker.busy;
         });
+        const int64_t cv_wait_end_us = full_timing ? ggml_time_us() : 0;
 
         // put the declined tasks back, keeping their order
         while (!queue_tasks_unhandled.empty()) {
@@ -264,6 +276,13 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
             std::swap(exception, worker.exception);
         } else {
             worker.exception = nullptr;
+        }
+
+        if (full_timing) {
+            QUE_INF("full-step queue work_start_us=%" PRId64 " work_end_us=%" PRId64
+                    " work_us=%" PRId64 " cv_wait_us=%" PRId64 " return_us=%" PRId64 "\n",
+                    work_start_us, work_end_us, work_end_us - work_start_us,
+                    cv_wait_end_us - cv_wait_start_us, ggml_time_us() - work_start_us);
         }
     }
 

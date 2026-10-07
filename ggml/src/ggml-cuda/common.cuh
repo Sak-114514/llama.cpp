@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1452,6 +1453,23 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// true if the bytes of x and y overlap. A fused kernel that writes one tensor while it reads another which the unfused
+// graph has already finished with must check this: the allocator may have placed the output on top of that input.
+static inline bool ggml_cuda_ranges_overlap(const ggml_tensor * x, const ggml_tensor * y) {
+    if (x == nullptr || y == nullptr || x->data == nullptr || y->data == nullptr) {
+        return false;
+    }
+    const char * xb = (const char *) x->data;
+    const char * yb = (const char *) y->data;
+    return xb < yb + ggml_nbytes(y) && yb < xb + ggml_nbytes(x);
+}
+
+// the data of src for a fused kernel that writes dst while it still reads src: src itself, or a copy in tmp when dst
+// overlaps it (see ggml_cuda_ranges_overlap). The copy is stream-ordered before the kernel, like any pool buffer.
+struct ggml_backend_cuda_context;
+const void * ggml_cuda_stage_if_overlap(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * src,
+        ggml_cuda_pool_alloc<char> & tmp);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1463,6 +1481,109 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    // The last GEMV inputs quantized to q8_1 (see ggml_cuda_mul_mat_vec_q), least recently used first: GEMVs that read
+    // the same activation reuse it. A producer kernel may also write it for its consumer GEMV (q8_1_cache_produce).
+    // Invalidated when a node other than the producer writes into the source range, and at every graph evaluation.
+    struct q8_1_cache_t {
+        const char *        src      = nullptr;
+        size_t              bytes    = 0;      // source range
+        int64_t             ne0      = 0;
+        int64_t             nrows    = 0;
+        bool                contig   = false;
+        int64_t             ne[4]    = {0};
+        size_t              nb[4]    = {0};
+        const ggml_tensor * producer = nullptr;
+        void *              buf      = nullptr;
+        size_t              cap      = 0;
+
+        void set(const ggml_tensor * t, const ggml_tensor * prod) {
+            src      = (const char *) t->data;
+            bytes    = ggml_nbytes(t);
+            ne0      = t->ne[0];
+            nrows    = ggml_nrows(t);
+            contig   = ggml_is_contiguous(t);
+            producer = prod;
+            memcpy(ne, t->ne, sizeof(ne));
+            memcpy(nb, t->nb, sizeof(nb));
+        }
+        // the same quantized layout: same rows of the same memory
+        bool matches(const ggml_tensor * t) const {
+            if (src != (const char *) t->data) {
+                return false;
+            }
+            if (contig && ggml_is_contiguous(t)) {
+                return ne0 == t->ne[0] && nrows == ggml_nrows(t);
+            }
+            return memcmp(ne, t->ne, sizeof(ne)) == 0 && memcmp(nb, t->nb, sizeof(nb)) == 0;
+        }
+    } q8_1_cache[2];
+
+    // nodes computed ahead of their place in the graph being evaluated (a combined GEMV launch): skipped when reached
+    std::unordered_set<const ggml_tensor *> precomputed;
+
+
+    // the node being evaluated (producers look for the GEMV that consumes their output)
+    const ggml_cgraph * eval_graph = nullptr;
+    int                 eval_i     = 0;
+
+    void q8_1_cache_clear() {
+        for (auto & c : q8_1_cache) {
+            c.src = nullptr;
+        }
+    }
+
+    // take the least recently used entry for key, written by producer; nullptr if too large
+    void * q8_1_cache_produce(const ggml_tensor * key, const ggml_tensor * producer, size_t q8_bytes) {
+        if (q8_bytes > (1 << 20)) {
+            return nullptr;
+        }
+        std::swap(q8_1_cache[0], q8_1_cache[1]);
+        auto & c = q8_1_cache[1];
+        if (c.buf == nullptr) {
+            c.cap = 1 << 20;
+            CUDA_CHECK(cudaMalloc(&c.buf, c.cap));
+        }
+        c.set(key, producer);
+        return c.buf;
+    }
+
+    void q8_1_cache_invalidate_range(const void * data, size_t n, const ggml_tensor * writer = nullptr) {
+        const char * p = (const char *) data;
+        for (auto & c : q8_1_cache) {
+            if (c.src != nullptr && (writer == nullptr || c.producer != writer) && p < c.src + c.bytes && c.src < p + n) {
+                c.src = nullptr;
+            }
+        }
+    }
+
+    // src1 of a quantized GEMV (MUL_MAT or MUL_MAT_ID) evaluated soon after the current node that reads exactly out;
+    //     nullptr if there is none, or if another node writes out first
+    const ggml_tensor * q8_1_consumer(const ggml_tensor * out) const {
+        if (eval_graph == nullptr || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
+            return nullptr;
+        }
+        const char * ob = (const char *) out->data;
+        const char * oe = ob + ggml_nbytes(out);
+        for (int j = eval_i + 1; j < eval_graph->n_nodes && j <= eval_i + 64; ++j) {
+            const ggml_tensor * n = eval_graph->nodes[j];
+            if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[1] != nullptr &&
+                    n->src[1]->data == out->data && ggml_nbytes(n->src[1]) == ggml_nbytes(out) &&
+                    n->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(n->src[1]) && ggml_is_quantized(n->src[0]->type) &&
+                    (n->op == GGML_OP_MUL_MAT ? ggml_nrows(n->src[1]) : n->src[1]->ne[2]*n->src[1]->ne[3]) <= 8) { // <= 8 tokens
+                return n->src[1];
+            }
+            bool is_src = false; // inputs of out (computed already, possibly in the same memory)
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                is_src |= out->src[s] == n;
+            }
+            const char * nb_ = (const char *) n->data;
+            if (!is_src && n->data != nullptr && n != out && n->view_src == nullptr && nb_ < oe && ob < nb_ + ggml_nbytes(n)) {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1580,6 +1701,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // mmvf only, applied to the result last: 1 = sigmoid, 2 = softplus(x + post_pre[row]) * post_mul[row]
+    int post_op = 0;
+    const ggml_tensor * post_pre = nullptr;
+    const ggml_tensor * post_mul = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1589,6 +1714,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    int post_op = 0;
+    const float * post_pre = nullptr;
+    const float * post_mul = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -41,7 +41,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+            // Distinct meta devices can have the same display name ("Meta()").
+            // Cache contexts must follow buffer identity, just like weight contexts.
+            const int name_cmp = strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs));
+            return name_cmp != 0 ? name_cmp < 0 : std::less<ggml_backend_buffer_type_t>{}(lhs, rhs);
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;

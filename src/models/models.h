@@ -2383,13 +2383,20 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;
+    class llm_graph_input_qsa_blk;
+    class llm_graph_input_qsa_mblk;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // tag-dispatched ctor for graph_mtp: binds the members without building the trunk
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2427,6 +2434,77 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+
+        // pooled block-key cache (see llama_memory_hybrid_idx::get_mem_blk): inputs per ratio,
+        // the incremental update, and the fixed-cost decode selection + attention over whole blocks
+        std::map<uint32_t, llm_graph_input_qsa_blk *> qsa_blk_inps;
+
+        llm_graph_input_qsa_blk * get_qsa_blk_input(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                       uint32_t   ratio,
+                           bool   fast);
+
+        ggml_tensor * build_qsa_blk_update(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_blk * inp,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_qsa_blk_select(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_blk * inp,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_attn_qsa_blk(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_qsa_blk * blk_inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * top_blk,
+                          float   kq_scale,
+                            int   il);
+
+        // per-sequence pooled block-key cache (LLAMA_QSA_POOLED_MULTI=1): the same roles as
+        // the three above, with each sequence selecting over its own rows of the pooled cache
+        // and gathering its own member cells, so sequences may share one cells array
+        std::map<uint32_t, llm_graph_input_qsa_mblk *> qsa_mblk_inps;
+
+        llm_graph_input_qsa_mblk * get_qsa_mblk_input(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                       uint32_t   ratio,
+                        int64_t   n_sel);
+
+        ggml_tensor * build_qsa_mblk_update(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_mblk * inp,
+                            int * sections,
+                            int   il);
+
+        ggml_tensor * build_qsa_mblk_select(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+        llm_graph_input_qsa_mblk * inp,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                    int * sections,
+                    int   il);
+
+        ggml_tensor * build_attn_qsa_mblk(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_qsa_mblk * blk_inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * sel_cells,
+                          float   kq_scale,
+                            int   il);
+
+        // device-bound owner for the fused CUDA hyper-connection kernels, chosen by build_hc_mix
+        // from the layer's weights and reused by the build_hc_combine that closes the sublayer
+        void * hc_owner = nullptr;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
@@ -2479,6 +2557,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    // LLM_GRAPH_TYPE_DECODER_MTP draft head: one HC-wrapped dense-attention + MoE block
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -1649,16 +1649,31 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // An id outside [0, n_as) marks a route this matmul must NOT compute -- the MoE
+        // expert cache uses it to hand routes it serves from VRAM to the GPU chain, leaving
+        // only the misses here. Such rows are skipped and their destination is zeroed, so
+        // summing the two chains reproduces the uncached result exactly.
+        bool has_skipped = false;
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0 || i02 >= n_as) {
+                    has_skipped = true;
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+
+        if (has_skipped) {
+            // zero everything before the barrier; the worker threads then overwrite exactly
+            // the rows they computed, leaving the skipped ones at zero
+            memset(dst->data, 0, ggml_nbytes(dst));
         }
     }
 
@@ -2109,6 +2124,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_PLE_CONV_SM70:
+            {
+                ggml_compute_forward_ple_conv_sm70(params, tensor);
+            } break;
+        case GGML_OP_HC_FUSED:
+            {
+                ggml_compute_forward_hc_fused(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2169,6 +2192,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_ALLREDUCE:
+        case GGML_OP_ARGMAX_SPLIT:
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2250,6 +2275,40 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
+static int ggml_cpu_ple_get_rows_threads(const char * name) {
+    const char * e = getenv(name);
+    if (e == NULL || *e == '\0') {
+        return 1;
+    }
+
+    char * end = NULL;
+    errno = 0;
+    const long value = strtol(e, &end, 10);
+    if (end == e || *end != '\0' || errno == ERANGE || value < 1 || value > 32) {
+        return 1;
+    }
+    return (int) value;
+}
+
+static int ggml_cpu_ple_get_rows_n_tasks(const struct ggml_tensor * node, int n_threads) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    // PLE GET_ROWS writes disjoint output rows; keep other GET_ROWS and SET_ROWS serial.
+    if (src0 == NULL || src1 == NULL || strcmp(src0->name, "per_layer_token_embd.weight") != 0 ||
+            ggml_nbytes(src0) <= (size_t) 64*1024*1024) {
+        return 1;
+    }
+
+    const int64_t n_rows = ggml_nelements(src1);
+    if (n_rows < 512) {
+        const int requested = ggml_cpu_ple_get_rows_threads("GGML_CPU_PLE_DECODE_THREADS");
+        return MIN(MIN(requested, n_threads), MAX(1, (int) (n_rows/4)));
+    }
+
+    const int requested = ggml_cpu_ple_get_rows_threads("GGML_CPU_PLE_GET_ROWS_THREADS");
+    return MIN(MIN(requested, n_threads), (int) (n_rows/32));
+}
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -2292,8 +2351,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_HC_FUSED:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_PLE_CONV_SM70:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
@@ -2368,11 +2432,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+            {
+                n_tasks = ggml_cpu_ple_get_rows_n_tasks(node, n_threads);
+            } break;
         case GGML_OP_SET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
@@ -2501,6 +2565,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = 1;
             } break;
+        case GGML_OP_ALLREDUCE:
+        case GGML_OP_ARGMAX_SPLIT:
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2927,6 +2993,10 @@ struct ggml_cplan ggml_graph_plan(
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
+                case GGML_OP_GET_ROWS:
+                    {
+                        cur = 64; // shared ownership of an optional CPU PLE row cache
+                    } break;
                 case GGML_OP_SET_ROWS:
                     {
                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
@@ -3037,7 +3107,9 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
-                case GGML_OP_COUNT:
+                case GGML_OP_ALLREDUCE:
+                case GGML_OP_ARGMAX_SPLIT:
+        case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");
                     }
