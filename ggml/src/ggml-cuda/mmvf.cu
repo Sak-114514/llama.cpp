@@ -376,6 +376,15 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
+    // same rounding as the separate kernels: unary op_sigmoid, and elem_chain (add, op_softplus, mul)
+    if (fusion.post_op == 1) {
+        value = 1.0f / (1.0f + expf(-value));
+    } else if (fusion.post_op == 2) {
+        value = __fadd_rn(value, fusion.post_pre[row]);
+        value = (value > 20.0f) ? value : logf(1.0f + expf(value));
+        value = __fmul_rn(value, fusion.post_mul[row]);
+    }
+
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
@@ -631,6 +640,199 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+
+// Split-K matrix-vector product for float weights with very few rows (tiny heads such as
+// hyper-connection injections, gated-delta-net alpha/beta, shared-expert gates): the regular
+// kernel launches one block per row, which leaves most of the GPU idle for a handful of rows
+// with a long K. Blocks here own a (row, K chunk) pair and write partial sums; a second kernel
+// adds the partials in a fixed order, so results are deterministic.
+template <typename T, int ncols_dst>
+static __global__ void mul_mat_vec_f_splitk_partial(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ partial,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int chunk) {
+    const int row   = blockIdx.x;
+    const int split = blockIdx.y;
+    const int k0    = split*chunk;
+    const int k1    = min(ncols_x, k0 + chunk);
+
+    const T * xr = x + (int64_t) row*stride_row_x;
+
+    float acc[ncols_dst] = {0.0f};
+    for (int k = k0 + threadIdx.x; k < k1; k += blockDim.x) {
+        const float xv = ggml_cuda_cast<float>(xr[k]);
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            acc[c] += xv * y[(int64_t) c*stride_col_y + k];
+        }
+    }
+
+    __shared__ float red[ncols_dst][32];
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        acc[c] = warp_reduce_sum(acc[c]);
+        if (lane == 0) {
+            red[c][warp] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < ncols_dst) {
+        const int c = threadIdx.x;
+        float sum = 0.0f;
+        for (int w = 0; w < (int) blockDim.x/WARP_SIZE; ++w) {
+            sum += red[c][w];
+        }
+        partial[((int64_t) split*ncols_dst + c)*nrows_x + row] = sum;
+    }
+}
+
+// Single-launch form: the last block to finish a row adds that row's partials, in split order, so the
+// result matches the two-kernel form bit for bit. Row counters live in a zeroed per-device buffer and
+// are reset by the reducing block; each launch takes its own slice of counters.
+template <typename T, int ncols_dst>
+static __global__ void mul_mat_vec_f_splitk_fused(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ partial, float * __restrict__ dst,
+        unsigned int * __restrict__ counters, const int ncols_x, const int nrows_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, const int chunk, const int nsplit) {
+    const int row   = blockIdx.x;
+    const int split = blockIdx.y;
+    const int k0    = split*chunk;
+    const int k1    = min(ncols_x, k0 + chunk);
+
+    const T * xr = x + (int64_t) row*stride_row_x;
+
+    float acc[ncols_dst] = {0.0f};
+    for (int k = k0 + threadIdx.x; k < k1; k += blockDim.x) {
+        const float xv = ggml_cuda_cast<float>(xr[k]);
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            acc[c] += xv * y[(int64_t) c*stride_col_y + k];
+        }
+    }
+
+    __shared__ float red[ncols_dst][32];
+    __shared__ bool  last;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        acc[c] = warp_reduce_sum(acc[c]);
+        if (lane == 0) {
+            red[c][warp] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < ncols_dst) {
+        const int c = threadIdx.x;
+        float sum = 0.0f;
+        for (int w = 0; w < (int) blockDim.x/WARP_SIZE; ++w) {
+            sum += red[c][w];
+        }
+        partial[((int64_t) split*ncols_dst + c)*nrows_x + row] = sum;
+        __threadfence();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(&counters[row], 1u) == (unsigned int) nsplit - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    if (threadIdx.x < ncols_dst) {
+        const int c = threadIdx.x;
+        float sum = 0.0f;
+        for (int s = 0; s < nsplit; ++s) {
+            sum += __ldcg(&partial[((int64_t) s*ncols_dst + c)*nrows_x + row]);
+        }
+        dst[(int64_t) c*stride_col_dst + row] = sum;
+    }
+    if (threadIdx.x == 0) {
+        counters[row] = 0;
+    }
+}
+
+static unsigned int * mul_mat_vec_f_splitk_counters(const int nrows, cudaStream_t stream) {
+    constexpr int n_counters = 1 << 16;
+    static unsigned int * buf[GGML_CUDA_MAX_DEVICES] = {};
+    static int next[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = ggml_cuda_get_device();
+    if (buf[dev] == nullptr) {
+        CUDA_CHECK(cudaMalloc(&buf[dev], n_counters*sizeof(unsigned int)));
+        // stream-ordered, so a first use inside graph capture stays legal
+        CUDA_CHECK(cudaMemsetAsync(buf[dev], 0, n_counters*sizeof(unsigned int), stream));
+    }
+    if (next[dev] + nrows > n_counters) {
+        next[dev] = 0;
+    }
+    unsigned int * p = buf[dev] + next[dev];
+    next[dev] += nrows;
+    return p;
+}
+
+template <int ncols_dst>
+static __global__ void mul_mat_vec_f_splitk_reduce(
+        const float * __restrict__ partial, float * __restrict__ dst, const int nrows_x, const int nsplit, const int stride_col_dst) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nrows_x*ncols_dst) {
+        return;
+    }
+    const int row = i % nrows_x;
+    const int c   = i / nrows_x;
+    float sum = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        sum += partial[((int64_t) s*ncols_dst + c)*nrows_x + row];
+    }
+    dst[(int64_t) c*stride_col_dst + row] = sum;
+}
+
+template <typename T, int ncols_dst>
+static void mul_mat_vec_f_splitk_launch(ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+    constexpr int block_size = 128;
+    // aim for a few hundred blocks, with chunks of whole block_size strides
+    int nsplit = std::max(1, (4*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm + nrows_x - 1) / nrows_x);
+    nsplit = std::min(nsplit, std::max(1, ncols_x / (2*block_size)));
+    int chunk = (ncols_x + nsplit - 1) / nsplit;
+    chunk = (chunk + block_size - 1) / block_size * block_size;
+    nsplit = (ncols_x + chunk - 1) / chunk;
+
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) nsplit*ncols_dst*nrows_x);
+    cudaStream_t stream = ctx.stream();
+
+    static const bool two_kernels = getenv("GGML_CUDA_MMVF_SPLITK") && atoi(getenv("GGML_CUDA_MMVF_SPLITK")) == 2;
+    if (!two_kernels) {
+        mul_mat_vec_f_splitk_fused<T, ncols_dst><<<dim3(nrows_x, nsplit), block_size, 0, stream>>>(
+            x, y, partial.get(), dst, mul_mat_vec_f_splitk_counters(nrows_x, stream), ncols_x, nrows_x, stride_row_x, stride_col_y,
+            stride_col_dst, chunk, nsplit);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    mul_mat_vec_f_splitk_partial<T, ncols_dst><<<dim3(nrows_x, nsplit), block_size, 0, stream>>>(
+        x, y, partial.get(), ncols_x, nrows_x, stride_row_x, stride_col_y, chunk);
+    const int n = nrows_x*ncols_dst;
+    mul_mat_vec_f_splitk_reduce<ncols_dst><<<(n + 255)/256, 256, 0, stream>>>(partial.get(), dst, nrows_x, nsplit, stride_col_dst);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+static bool mul_mat_vec_f_splitk(ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst, const int ncols_dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_f_splitk_launch<T, 1>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 2: mul_mat_vec_f_splitk_launch<T, 2>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 3: mul_mat_vec_f_splitk_launch<T, 3>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 4: mul_mat_vec_f_splitk_launch<T, 4>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 5: mul_mat_vec_f_splitk_launch<T, 5>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 6: mul_mat_vec_f_splitk_launch<T, 6>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 7: mul_mat_vec_f_splitk_launch<T, 7>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        case 8: mul_mat_vec_f_splitk_launch<T, 8>(ctx, x, y, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); return true;
+        default: return false;
+    }
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -658,11 +860,32 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
+    // few rows, long K, plain 2D product: split K across blocks (see mul_mat_vec_f_splitk_partial)
+    static const bool splitk_enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVF_SPLITK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (splitk_enabled && !ids && !fusion && ne01 <= 16 && ne00 >= 4096 && ne11 >= 2 && ne11 <= 8 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
+        const int stride_row_x   = nb01/ts_src0;
+        const int stride_col_y   = nb11/ts_src1;
+        const int stride_col_dst = nb1/ts_dst;
+        const bool done = src0->type == GGML_TYPE_F32
+            ? mul_mat_vec_f_splitk(ctx, (const float *) src0->data, src1_d, dst_d, ne11, ne00, ne01, stride_row_x, stride_col_y, stride_col_dst)
+            : mul_mat_vec_f_splitk(ctx, (const half  *) src0->data, src1_d, dst_d, ne11, ne00, ne01, stride_row_x, stride_col_y, stride_col_dst);
+        if (done) {
+            return;
+        }
+    }
+
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        if (fusion->x_bias || fusion->gate || fusion->gate_bias) { // the post op alone works for any batch
+            GGML_ASSERT( !ids || dst->ne[2] == 1);
+            GGML_ASSERT(  ids || dst->ne[1] == 1);
+        }
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -681,6 +904,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        fusion_local.post_op = fusion->post_op;
+        if (fusion->post_op == 2) {
+            fusion_local.post_pre = (const float *) fusion->post_pre->data;
+            fusion_local.post_mul = (const float *) fusion->post_mul->data;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -815,7 +1043,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
                 }
-                return ne11 <= 3;
+                // Volta: cuBLAS SGEMM + split-K is slower than MMVF for speculative verify batches
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;

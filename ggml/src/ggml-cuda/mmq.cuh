@@ -1483,7 +1483,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    // MoE: ncols_max is the whole batch, but each expert only gets its share of it. Cap the tile width
+    // by the tokens per expert, otherwise nearly all columns of the widest tile compute nothing.
+    // Measured on V100 (dp4a MMQ), 10 of 512 experts: 32 wide is best at 5 and at 10 tokens per expert
+    // (256/512-token ubatch); 8/16/24/48/64/128 are all slower. GGML_CUDA_MMQ_MOE_J overrides.
+    int J_max = 128;
+    if (args.expert_bounds != nullptr && args.nchannels_x > 0) {
+        static const int J_env = getenv("GGML_CUDA_MMQ_MOE_J") ? atoi(getenv("GGML_CUDA_MMQ_MOE_J")) : 0;
+        const int64_t avg = (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
+        if (J_env > 0) {
+            J_max = J_env;
+        } else if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
+            J_max = avg <= 16 ? 32 : avg <= 32 ? 64 : 128;
+        }
+    }
+
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;

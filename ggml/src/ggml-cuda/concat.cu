@@ -139,6 +139,41 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// short rows (e.g. the GDN conv window: 3 state columns + a few tokens, 10240 channels): one thread
+// per element instead of one mostly idle block per row
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t n,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0*ne1)) % ne2;
+    const int64_t i3 = i / (ne0*ne1*ne2);
+
+    const T * x;
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    } else if constexpr (dim == 0) {
+        x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+    } else if constexpr (dim == 1) {
+        x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+    } else if constexpr (dim == 2) {
+        x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+    } else {
+        x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+    }
+    *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +197,27 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE/4) {
+            const int64_t n = ggml_nelements(dst);
+            auto launch_flat = [&](auto dim) {
+                concat_non_cont_flat<T, dim><<<(n + CUDA_CONCAT_BLOCK_SIZE - 1)/CUDA_CONCAT_BLOCK_SIZE, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                    (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                    dst->ne[0], dst->ne[1], dst->ne[2], n,
+                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            };
+            switch (dim) {
+                case 0: launch_flat(std::integral_constant<int, 0>{}); break;
+                case 1: launch_flat(std::integral_constant<int, 1>{}); break;
+                case 2: launch_flat(std::integral_constant<int, 2>{}); break;
+                case 3: launch_flat(std::integral_constant<int, 3>{}); break;
+                default: GGML_ABORT("Invalid dim: %d", dim);
+            }
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
@@ -239,4 +295,77 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 break;
         }
     }
+}
+
+// CONCAT along dim 0 followed by copies of views of its result (the conv state slots of a recurrent layer): one kernel
+// computes every element of the concat, writes it, and writes it again into each copy whose source view covers it.
+// Source views must share the concat's nb[1..3] (a window of dim 0); destinations must be contiguous.
+struct concat_copies_args {
+    const char * src0; size_t s0nb0, s0nb1, s0nb2; int64_t ne00;          // first part [ne00, ne1, ne2]
+    const char * src1; size_t s1nb0, s1nb1, s1nb2;                        // second part [ne0 - ne00, ne1, ne2]
+    char * dst; size_t dnb0, dnb1, dnb2; int64_t ne0, ne1, ne2;           // concat result
+    int n_copies;
+    char *  cdst[GGML_CUDA_CONCAT_MAX_COPIES];                           // contiguous destinations
+    int64_t cofs[GGML_CUDA_CONCAT_MAX_COPIES];                           // first dim-0 index of the source window
+    int64_t cne0[GGML_CUDA_CONCAT_MAX_COPIES];                           // window width along dim 0
+};
+
+static __global__ void concat_copies_f32(const concat_copies_args a) {
+    const int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= a.ne0*a.ne1*a.ne2) {
+        return;
+    }
+    const int64_t i0 = k % a.ne0;
+    const int64_t i1 = (k / a.ne0) % a.ne1;
+    const int64_t i2 = k / (a.ne0*a.ne1);
+    const float v = i0 < a.ne00
+        ? *(const float *) (a.src0 + i0*a.s0nb0 + i1*a.s0nb1 + i2*a.s0nb2)
+        : *(const float *) (a.src1 + (i0 - a.ne00)*a.s1nb0 + i1*a.s1nb1 + i2*a.s1nb2);
+    *(float *) (a.dst + i0*a.dnb0 + i1*a.dnb1 + i2*a.dnb2) = v;
+    for (int c = 0; c < a.n_copies; ++c) {
+        const int64_t j0 = i0 - a.cofs[c];
+        if (j0 >= 0 && j0 < a.cne0[c]) {
+            ((float *) a.cdst[c])[j0 + a.cne0[c]*(i1 + a.ne1*i2)] = v;
+        }
+    }
+}
+
+// the CPY nodes whose sources are windows of concat; returns false if the pattern does not fit
+bool ggml_cuda_concat_copies_match(const ggml_tensor * concat, const ggml_tensor * const * copies, int n) {
+    if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 ||
+            concat->src[0]->type != GGML_TYPE_F32 || concat->src[1]->type != GGML_TYPE_F32 || concat->ne[3] != 1 ||
+            n < 1 || n > GGML_CUDA_CONCAT_MAX_COPIES) {
+        return false;
+    }
+    for (int c = 0; c < n; ++c) {
+        const ggml_tensor * cp  = copies[c];
+        const ggml_tensor * src = cp->src[0];
+        const ggml_tensor * dst = cp->src[1];
+        if (cp->op != GGML_OP_CPY || src->view_src != concat || src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(dst) || ggml_nelements(dst) != ggml_nelements(src) ||
+                src->nb[1] != concat->nb[1] || src->nb[2] != concat->nb[2] || src->ne[1] != concat->ne[1] ||
+                src->ne[2] != concat->ne[2] || src->ne[3] != 1 || src->nb[0] != concat->nb[0] ||
+                src->view_offs % concat->nb[0] != 0 || src->view_offs / concat->nb[0] + src->ne[0] > concat->ne[0]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_concat_copies(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * const * copies, int n) {
+    const ggml_tensor * s0 = concat->src[0];
+    const ggml_tensor * s1 = concat->src[1];
+    concat_copies_args a = {};
+    a.src0 = (const char *) s0->data; a.s0nb0 = s0->nb[0]; a.s0nb1 = s0->nb[1]; a.s0nb2 = s0->nb[2]; a.ne00 = s0->ne[0];
+    a.src1 = (const char *) s1->data; a.s1nb0 = s1->nb[0]; a.s1nb1 = s1->nb[1]; a.s1nb2 = s1->nb[2];
+    a.dst  = (char *) concat->data;   a.dnb0  = concat->nb[0]; a.dnb1 = concat->nb[1]; a.dnb2 = concat->nb[2];
+    a.ne0  = concat->ne[0]; a.ne1 = concat->ne[1]; a.ne2 = concat->ne[2];
+    a.n_copies = n;
+    for (int c = 0; c < n; ++c) {
+        a.cdst[c] = (char *) copies[c]->src[1]->data;
+        a.cofs[c] = copies[c]->src[0]->view_offs / concat->nb[0];
+        a.cne0[c] = copies[c]->src[0]->ne[0];
+    }
+    const int64_t ne = a.ne0*a.ne1*a.ne2;
+    concat_copies_f32<<<(ne + 255) / 256, 256, 0, ctx.stream()>>>(a);
 }

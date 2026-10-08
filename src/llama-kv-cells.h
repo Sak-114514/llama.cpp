@@ -362,6 +362,15 @@ public:
 
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
+    // the cells carrying seq_id with p0 <= pos < p1, in position order (from seq_pos, without a full scan)
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & res) const {
+        assert(seq_id >= 0);
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+            res.push_back(it->second);
+        }
+    }
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);

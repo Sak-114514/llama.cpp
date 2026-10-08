@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -104,7 +106,10 @@ llama_kv_cache::llama_kv_cache(
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+            // Distinct meta devices can have the same display name ("Meta()").
+            // Cache contexts must follow buffer identity, just like weight contexts.
+            const int name_cmp = strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs));
+            return name_cmp != 0 ? name_cmp < 0 : std::less<ggml_backend_buffer_type_t>{}(lhs, rhs);
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
@@ -402,15 +407,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // the cells of seq_id in [p0, p1) come straight from its position index, so trimming a few
+        // trailing tokens (speculative rollback) does not scan every cell of a long context
+        std::vector<uint32_t> idxs;
+        cells.seq_cells_in(seq_id, p0, p1, idxs);
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -1252,7 +1255,48 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_DECODE_KV_PAD: coarser n_kv granularity for every batch, so decode/verify graphs
+    // walk through fewer distinct n_kv buckets and rebuild their CUDA graph less often. the
+    // extra cells are masked out by the kq mask, so the results are unchanged - the only cost
+    // is the attention kernels touching up to (pad-1) masked cells per query row.
+    static const uint32_t decode_pad = [] {
+        const char * e = std::getenv("LLAMA_DECODE_KV_PAD");
+        if (e == nullptr || *e == '\0') {
+            return 0u;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long value = std::strtoul(e, &end, 10);
+        if (end == e || *end != '\0' || errno == ERANGE || value < 256 || value > 65536 ||
+                !ggml_is_power_of_2((int) value)) {
+            return 0u;
+        }
+        return (uint32_t) value;
+    }();
+    if (decode_pad != 0) {
+        n_pad_cur = std::max(n_pad_cur, decode_pad);
+    }
+    // Coarser views only for large prompt ubatches: reuse graph allocation
+    // across several appends while keeping the normal decode view unchanged.
+    // Storage, positions, causal masks and sequence visibility stay unchanged.
+    static const uint32_t prefill_pad = [] {
+        const char * e = std::getenv("LLAMA_PREFILL_KV_PAD");
+        if (e == nullptr || *e == '\0') {
+            return 0u;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long value = std::strtoul(e, &end, 10);
+        if (end == e || *end != '\0' || errno == ERANGE || value < 512 || value > 65536 ||
+                !ggml_is_power_of_2((int) value)) {
+            return 0u;
+        }
+        return (uint32_t) value;
+    }();
+    if (prefill_pad != 0 && !sinfo.empty() && sinfo.size()*sinfo.n_stream() > 64) {
+        n_pad_cur = std::max(n_pad_cur, prefill_pad);
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -2786,6 +2830,45 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
+}
+
+bool llama_kv_cache_context::ubatch_cells_follow() const {
+    if (!has_ubatch()) {
+        return false;
+    }
+    const auto & sinfo  = sinfos[i_cur];
+    const auto & ubatch = ubatches[i_cur];
+    if (sinfo.n_stream() != 1 || sinfo.strm[0] != 0 || sinfo.size() == 0 || ubatch.n_tokens == 0) {
+        return false;
+    }
+    const uint32_t c0 = sinfo.idxs[0][0];
+    for (uint32_t i = 1; i < sinfo.size(); ++i) {
+        if (sinfo.idxs[0][i] != c0 + i) {
+            return false;
+        }
+    }
+    // every used cell lies below the ubatch's end and none is missing
+    const auto & cells = kv->get_cells(ubatch.seq_id[0][0]);
+    const uint32_t end = c0 + sinfo.size();
+    return cells.used_max_p1() == end && cells.get_used() == end;
+}
+
+uint32_t llama_kv_cache_context::ubatch_cell0() const {
+    GGML_ASSERT(has_ubatch() && sinfos[i_cur].size() > 0);
+    return sinfos[i_cur].idxs[0][0];
+}
+
+void llama_kv_cache_context::cell_rope_pos(uint32_t i, int32_t * sec) const {
+    GGML_ASSERT(has_ubatch());
+    const auto & cells = kv->get_cells(ubatches[i_cur].seq_id[0][0]);
+    const llama_pos p = cells.pos_get(i);
+    const auto &    e = cells.ext_get(i);
+    // a cell never given 2d positions stores zeros there: a 1d position then fills every section
+    const bool is_2d = e.x != 0 || e.y != 0 || p == 0;
+    sec[0] = p;
+    sec[1] = is_2d ? e.y : p;
+    sec[2] = is_2d ? e.x : p;
+    sec[3] = p;
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

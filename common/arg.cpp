@@ -2760,6 +2760,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"--ft-native-moe"}, "N",
+        "experimental Qwen4Exp native decode with N global expert slots (0 = off); requires -np 1",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("negative FreeToken slot count"); }
+            params.n_ft_native_moe = value;
+            if (value) { params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override()); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--moe-expert-cache"}, "N",
+        "keep N experts per MoE tensor resident in VRAM, serving routed experts from there and\n"
+        "falling back to their host copy for the rest (0 = disabled, the default)",
+        [](common_params & params, int value) {
+            params.n_moe_expert_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--moe-expert-cache-inserts"}, "N",
+        "experts promoted into the VRAM cache per tensor per decode step (default: 2)",
+        [](common_params & params, int value) {
+            params.n_moe_expert_inserts = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
@@ -4132,6 +4156,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
+    add_opt(common_arg(
+        {"--spec-mtp-adaptive"},
+        "adapt MTP draft depth between 2 and 3 using per-request acceptance (experimental, default: disabled)",
+        [](common_params & params) {
+            params.speculative.draft.mtp_adaptive = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
