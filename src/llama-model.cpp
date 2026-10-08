@@ -530,6 +530,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
+        // A single-member island (LLAMA_ISLAND_SPLIT=1,...) is a pure pipeline stage: nothing is
+        // sharded, every tensor lives in full on the one member. A real split axis with
+        // n_devices == 1 trips the meta split-state propagation asserts.
+        if (ud->n_devices == 1) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -1745,10 +1751,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         if (act_gpu_layers > 0 && !devices.empty()) {
-            for (size_t i = 0; i < n_devices(); ++i) {
-                splits[i] = i == 0
-                    ? std::min(1.0f, std::max(0.0f, float(island_layers - i_gpu_start)/act_gpu_layers))
-                    : 1.0f;
+            if (n_devices() > 2) {
+                // >2 islands (e.g. LLAMA_ISLAND_SPLIT=1,1,1,1,1,1): distribute GPU-resident
+                // blocks uniformly across meta devices; midpoint scheme only fills islands 0/1.
+                for (size_t i = 0; i < n_devices(); ++i) {
+                    splits[i] = std::min(1.0f, float(i + 1) / n_devices());
+                }
+                island_layers = i_gpu_start + (act_gpu_layers + (int) n_devices() - 1) / (int) n_devices();
+            } else {
+                for (size_t i = 0; i < n_devices(); ++i) {
+                    splits[i] = i == 0
+                        ? std::min(1.0f, std::max(0.0f, float(island_layers - i_gpu_start)/act_gpu_layers))
+                        : 1.0f;
+                }
             }
         }
         if (get_split_state_ud.n_devices > 0) {
